@@ -105,7 +105,7 @@ class Example:
         self.tri_ka = 1e4
         self.tri_kd = 1.5e-6
 
-        self.bending_ke = 5
+        self.bending_ke = 50
         self.bending_kd = 1e-2
 
         self.scene = ModelBuilder(gravity=-981.0)

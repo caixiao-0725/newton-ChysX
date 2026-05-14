@@ -40,6 +40,7 @@ import warp as wp
 
 import newton
 import newton.examples
+from newton.examples.chysx._camera import frame_z_up_camera_viewer
 
 
 class Example:
@@ -159,13 +160,11 @@ class Example:
         self._initial_q = self.state_0.particle_q.numpy().reshape(-1, 3).copy()
 
         self.viewer.set_model(self.model)
-        # Camera looking slightly down at the table; the cloth drape
-        # over the edge is the most interesting view.
-        self.viewer.set_camera(
-            pos=wp.vec3(1.6, -1.6, 1.2),
-            pitch=-15.0,
-            yaw=45.0,
-        )
+        q = self._initial_q
+        bmin = q.min(axis=0).astype(np.float64)
+        bmax = q.max(axis=0).astype(np.float64)
+        bmin[2] = min(float(bmin[2]), 0.0)
+        frame_z_up_camera_viewer(self.viewer, bmin, bmax)
 
         # ---- CUDA Graph capture ----------------------------------------
         #

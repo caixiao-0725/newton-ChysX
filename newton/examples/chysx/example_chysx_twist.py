@@ -57,6 +57,7 @@ import warp as wp
 
 import newton
 import newton.examples
+from newton.examples.chysx._camera import frame_z_up_camera_viewer
 
 
 # Default cuda-cloth twist asset.  We ship a copy under
@@ -293,14 +294,9 @@ class Example:
         self._initial_q = verts_np.copy()
 
         self.viewer.set_model(self.model)
-        # Camera sits on +Z looking back along -Z, i.e. straight down
-        # the longitudinal twist axis.  The wrung cross-section is
-        # most legible from this angle.
-        self.viewer.set_camera(
-            pos=wp.vec3(0.0, 0.0, 1.5),
-            pitch=0.0,
-            yaw=0.0,
-        )
+        bbox_min = verts_np.min(axis=0)
+        bbox_max = verts_np.max(axis=0)
+        frame_z_up_camera_viewer(self.viewer, bbox_min, bbox_max)
         if hasattr(self.viewer, "_paused"):
             self.viewer._paused = True
 

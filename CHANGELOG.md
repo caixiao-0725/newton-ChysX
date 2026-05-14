@@ -44,6 +44,7 @@
 
 ### Changed
 
+- Replace ChysX `SolverChysX(static_contact_friction=...)` viscous tangential damping with IPC-style Lagged-Newton Coulomb friction. The parameter is now a dimensionless Coulomb coefficient `μ` (was `μ_v` in [N·s/m]); `α · (I - n n^T)` is baked onto A's diagonal with `α = μ · f_n · f1_SF_over_x(‖u_t,lag‖)` and the resulting tangential force is automatically bounded by `‖f_t‖ ≤ μ · f_n` without an explicit cone projection. Adds the companion `static_contact_friction_epsilon` (slip regularisation distance, default `1e-4 m`). Migration: replace previous `static_contact_friction=μ_v` (e.g. `1.0` N·s/m for `example_chysx_cloth_stack`, `1e-2` N·s/m for `example_chysx_tshirt_drop`) with a dimensionless `μ` (now `0.4` and `0.3` respectively in the examples).
 - Use pre-computed local AABB for `CONVEX_MESH` shapes in `compute_shape_aabbs`, avoiding a per-frame support-function AABB computation
 - Build mesh SDFs via the texture-based sparse path only; sample via `SDF.texture_data` instead of `SDF.sparse_volume` / `SDF.coarse_volume`.
 - Change implicit MPM default `solver` from `"gs"` to `"auto"`, which selects `"gs"` for trilinear bases and `"gs-batched"` for higher-order ones. Set `solver="gs"` explicitly to restore the previous behavior.

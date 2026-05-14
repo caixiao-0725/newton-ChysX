@@ -348,16 +348,29 @@ public:
     float static_contact_stiffness() const noexcept {
         return static_contacts_.stiffness();
     }
-    // Viscous tangential friction coefficient `μ_v` [N·s/m].  Adds
-    // `(μ_v / dt) * (I - n n^T)` to the per-particle Hessian block of
-    // every active static contact, producing implicit-Euler velocity-
-    // proportional friction without needing to solve the full Coulomb
-    // cone.  Zero (default) disables friction.
-    void set_static_contact_friction(float mu_v) noexcept {
-        static_contacts_.set_friction(mu_v);
+    // Coulomb friction coefficient `μ` (dimensionless).  Adds the
+    // Lagged-Newton linearisation of IPC isotropic Coulomb friction
+    // (Li et al. 2020) to the per-particle Hessian block of every
+    // active static contact.  At the solution `dx_t` the resulting
+    // tangential force is automatically capped by `‖f_t‖ ≤ μ · f_n`
+    // (the Coulomb cone), without an explicit projection step.  Zero
+    // (default) disables friction.  Replaces the earlier viscous
+    // formulation (`μ_v` [N·s/m]); see `StaticContactSet::set_friction`.
+    void set_static_contact_friction(float mu) noexcept {
+        static_contacts_.set_friction(mu);
     }
     float static_contact_friction() const noexcept {
         return static_contacts_.friction();
+    }
+    // Tangential slip regularisation distance `ε_u` [m] for the
+    // Coulomb friction model.  Tangential displacements smaller than
+    // `ε_u` produce a force linear in `dx_t`; beyond `ε_u` the force
+    // saturates at `μ·f_n`.  Default `1e-4 m`.
+    void set_static_contact_friction_epsilon(float eps_u) noexcept {
+        static_contacts_.set_friction_epsilon(eps_u);
+    }
+    float static_contact_friction_epsilon() const noexcept {
+        return static_contacts_.friction_epsilon();
     }
 
     int static_plane_count() const noexcept {

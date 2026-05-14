@@ -26,10 +26,12 @@
 
 from __future__ import annotations
 
+import numpy as np
 import warp as wp
 
 import newton
 import newton.examples
+from newton.examples.chysx._camera import frame_z_up_camera_viewer
 
 
 class Example:
@@ -91,11 +93,11 @@ class Example:
         self.contacts = self.model.contacts()
 
         self.viewer.set_model(self.model)
-        self.viewer.set_camera(
-            pos=wp.vec3(2.5, 2.5, 1.5),
-            pitch=-15.0,
-            yaw=-135.0,
-        )
+        q = q0.reshape(-1, 3)
+        bmin = q.min(axis=0).astype(np.float64)
+        bmax = q.max(axis=0).astype(np.float64)
+        bmin[2] = min(float(bmin[2]), 0.0)
+        frame_z_up_camera_viewer(self.viewer, bmin, bmax)
         self.viewer._paused = True  # start paused so the user can see the initial grid before it falls
 
     def step(self):

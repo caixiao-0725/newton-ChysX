@@ -281,19 +281,33 @@ class Example:
 
         # ---- viewer -----------------------------------------------------
         self.viewer.set_model(self.model)
-        # Camera looking at the cloth bbox centre from +Z; the rest
-        # pose's two interleaved sheets stack along world X, so a
-        # straight-down view shows the wrinkles best.
+        # ViewerGL uses Z-up; pitch=yaw=0 looks along **+X**, not down −Z.
+        # This mesh spans roughly [-1, 0.5] in X from rest — placing the
+        # camera at the bbox centre on +Z puts half the sheet behind the
+        # camera (invisible on frame 0).  Pull the eye back on −Y and up
+        # on +Z, then `look_at` the bbox centre so the whole cloth fills
+        # the opening view (same pattern as other chysx examples).
         bbox_min = verts_np.min(axis=0)
         bbox_max = verts_np.max(axis=0)
         centre = 0.5 * (bbox_min + bbox_max)
         extent = float(np.linalg.norm(bbox_max - bbox_min))
-        cam_pos = wp.vec3(
-            float(centre[0]),
-            float(centre[1]),
-            float(centre[2] + max(1.5, 1.5 * extent)),
+        dist = max(1.15 * extent, 1.25)
+        eye = (
+            float(centre[0] + 0.25 * dist),
+            float(centre[1] - 1.05 * dist),
+            float(centre[2] + 0.85 * dist),
         )
-        self.viewer.set_camera(pos=cam_pos, pitch=0.0, yaw=0.0)
+        tgt = (float(centre[0]), float(centre[1]), float(centre[2]))
+        cam = getattr(self.viewer, "camera", None)
+        if cam is not None:
+            cam.pos = cam._as_vec3(eye)
+            cam.look_at(cam._as_vec3(tgt))
+        else:
+            self.viewer.set_camera(
+                wp.vec3(eye[0], eye[1], eye[2]),
+                pitch=-82.0,
+                yaw=35.0,
+            )
         if hasattr(self.viewer, "_paused"):
             self.viewer._paused = True
 

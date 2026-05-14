@@ -2,57 +2,41 @@
 # SPDX-License-Identifier: Apache-2.0
 
 ###########################################################################
-# Example ChysX T-shirt Hanging  (gravity-OFF, pin-free variant)
+# Example ChysX T-shirt Hanging  (pinned collar + gravity fall)
 #
-# A USD T-shirt mesh sits in free space with **no gravity, no pins,
-# and no static-shape contact** -- only chysx's self-collision
-# pipeline is active (LBVH/QuantBvh broadphase + DCD narrow-phase,
-# contributions baked into the implicit-Euler PCG via the COO
-# sidecar).  This is the cleanest possible isolation test for the
-# self-contact code path: any motion the garment exhibits is by
-# construction caused by the self-collision detector reporting a
-# non-zero force on a state that should be at rest.
+# ``unisex_shirt.usd`` is authored flat with **X = width**, **Y = garment
+# height (neck toward +Y)**, **Z = front–back thickness** — same as
+# ``example_chysx_tshirt_drop``.  Pins are **high‑Y + near centre‑X** (neck /
+# collar opening), **not** ``max(Z)`` (that pins mainly one thickness sheet /
+# chest).  The garment is lifted to ``z = hang_height``.  World gravity is
+# Newton Z-up ``g_z = -9.81``; ``SolverChysX(gravity=(0, 0, -9.81))`` copies
+# the same vector into ChysX so the material matches ``Model.gravity``.
 #
-# Scene
-# -----
-# * No ground, no table, no pinned vertices, no gravity.
-# * Garment starts in its USD reference (rest) pose, centred at
-#   ``(0, 0, hang_height)`` so the camera framing matches the
-#   gravity-on variant of this scene.
-# * Stationary expected outcome: the T-shirt holds its 3-D shape
-#   indefinitely; if you see drift, swelling, or rotation, the
-#   self-contact pipeline is producing spurious / asymmetric forces.
+# Contacts
+# --------
 #
-# Why self_collision_thickness needs care here
-# ---------------------------------------------
-# The unisex T-shirt asset is a 3-D garment -- the front and back
-# panels are ~27 cm apart in the rest pose to model the wearer's
-# torso, but at the *rims* (sleeve cuffs, neck opening, bottom hem)
-# the front and back panels fold around to meet each other along a
-# narrow strip of fabric that is only a couple of millimetres wide.
-# A generous self-contact band that catches that rim strip will
-# fire ~2k stuck-together contacts on the rest pose itself, and
-# the asymmetric T-shirt geometry then bakes the resulting
-# non-zero contact-normal sum into a net force that inflates the
-# garment and drifts the centre of mass.  Empirically (this scene
-# was used to characterise it):
+# * **DCD self-collision** (VF / EE narrow-phase + QuantBvh broadphase).
+# * **EF untangle** (5-vertex ICM penalty, diagonal-only Hessian); shares
+#   the same EF broadphase stream as self-collision.
 #
-#   thickness    rest-pose contacts   stationary?
-#   ---------    ------------------   -----------
-#   0.5 mm                        0   yes
-#   1.0 mm                        0   yes  <- we use this
-#   2.0 mm                      184   no, inflates 27 cm -> 52 cm
-#   4.0 mm                     2265   no, inflates 27 cm -> 54 cm
+# Contact penalty stiffness:
 #
-# So we pick 1 mm here -- thin enough that the rims do not fire,
-# while still giving the DCD pipeline something concrete to
-# detect once a real fold develops.
+# * ``self_collision_stiffness = 1e3`` (VF / EE proximity),
+# * ``untangle_stiffness = 2e3`` (= 2× proximity, style3d-style ratio).
+#
+# Thickness (distance band, **not** stiffness): ``self_collision_thickness`` and
+# ``untangle_thickness`` are both ``1e-3`` m (1 mm).
 #
 # Command: ``python -m newton.examples chysx_tshirt_hanging``
+#
+# OBJ dump (optional): ``--obj-out DIR [--obj-stride N]`` writes
+# ``tshirt_hanging_<frame>.obj`` (deformed verts + rest connectivity).
 #
 ###########################################################################
 
 from __future__ import annotations
+
+import os
 
 import numpy as np
 import warp as wp
@@ -60,6 +44,7 @@ from pxr import Usd
 
 import newton
 import newton.examples
+from newton.examples.chysx._camera import frame_z_up_camera_viewer
 import newton.usd
 
 
@@ -91,17 +76,69 @@ def _load_centered_tshirt_m() -> tuple[np.ndarray, np.ndarray, float]:
     return v_m, idx, edge_med
 
 
+def _pin_indices_neck_collar(positions: np.ndarray, edge_med: float) -> np.ndarray:
+    """Pick collar / neck-hole vertices for ``unisex_shirt.usd`` rest pose.
+
+    See ``example_chysx_tshirt_drop``: USD uses ``Y`` along body height
+    (neck toward ``max(Y)``), ``X`` across width, ``Z`` through thickness.
+    Pinning ``max(Z)`` instead fixes mostly one front/back sheet — wrong.
+
+    We take a thin band ``y >= y_max - δ_y`` and restrict ``|x - x_mid|``
+    to the centre third of the bust width so sleeves stay free while the
+    neckline ring stays kinematic.
+
+    Args:
+        positions: ``(N, 3)`` world-space particle positions [m].
+        edge_med: Mesh median edge length [m].
+
+    Returns:
+        1-D int32 pinned particle indices.
+    """
+    x = positions[:, 0].astype(np.float64)
+    y = positions[:, 1].astype(np.float64)
+
+    y_lo = float(np.min(y))
+    y_hi = float(np.max(y))
+    y_span = max(y_hi - y_lo, 1e-6)
+
+    x_lo = float(np.min(x))
+    x_hi = float(np.max(x))
+    x_mid = 0.5 * (x_lo + x_hi)
+    x_extent = max(x_hi - x_lo, 1e-6)
+
+    tol_y = min(max(3.0 * float(edge_med), 5.0e-3), 0.05 * y_span)
+    tol_y = max(tol_y, 4.0e-3)
+
+    top = y >= y_hi - tol_y
+
+    # Collar sits near centreline; sleeves extend far in ±X.
+    half_w = max(0.16 * x_extent, 6.0 * float(edge_med))
+    centre_x = np.abs(x - x_mid) <= half_w
+
+    idx = np.nonzero(top & centre_x)[0].astype(np.int32)
+    if idx.size < 14:
+        half_w = max(0.28 * x_extent, 10.0 * float(edge_med))
+        centre_x = np.abs(x - x_mid) <= half_w
+        idx = np.nonzero(top & centre_x)[0].astype(np.int32)
+    if idx.size < 10:
+        idx = np.nonzero(top)[0].astype(np.int32)
+    if idx.size < 8:
+        thr = float(np.percentile(y, 98.8))
+        idx = np.nonzero(y >= thr)[0].astype(np.int32)
+    if idx.size == 0:
+        idx = np.array([int(np.argmax(y))], dtype=np.int32)
+    return idx
+
+
 class Example:
     def __init__(self, viewer, args):
         # ---- timing -----------------------------------------------------
-        # 60 fps render with 5 substeps -> 300 Hz physics.  No contact
-        # in this scene so the implicit-Euler step is dominated by the
-        # FEM elastic + bending Hessian, which is well-conditioned and
-        # converges quickly; we can afford a coarser substep here than
-        # the cloth-drop example needs.
-        self.fps = 60
+        # 60 fps render with 5 substeps -> 300 Hz physics.  Contacts +
+        # untangle keep the linear system stiff; five substeps per frame
+        # stays stable through the first swing-down frames.
+        self.fps = 100
         self.frame_dt = 1.0 / self.fps
-        self.sim_substeps = 5
+        self.sim_substeps = 1
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.sim_time = 0.0
 
@@ -109,17 +146,8 @@ class Example:
         self.args = args
 
         # ---- world ------------------------------------------------------
-        # Gravity OFF + no pins: this turns the scene into a pure
-        # self-collision test.  The garment starts at rest in its
-        # reference (USD-author-provided) configuration; with no
-        # external force and no kinematic constraint, the only thing
-        # that can move it is whatever forces the self-collision
-        # detector reports.  An ideal implementation should return
-        # zero contact forces on a non-self-intersecting rest pose,
-        # so the garment should stay perfectly still.  Any drift
-        # observed here is purely due to the self-contact pipeline
-        # (false-positive contacts, asymmetric normals, ...).
-        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=0.0)
+        # Scalar ``gravity=-9.81`` → ``model.gravity`` along −Z for Z-up.
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=-9.81)
 
         verts_m, tris, edge_med = _load_centered_tshirt_m()
         self._edge_med = edge_med
@@ -146,49 +174,50 @@ class Example:
 
         self.model = builder.finalize()
 
-        # No pins: the garment is fully free.  In a zero-gravity scene
-        # this means the only forces acting on the cloth come from
-        # internal elastic / bending energy (which should be zero at
-        # the rest configuration) and from the self-collision penalty.
         q0 = self.model.particle_q.numpy().reshape(-1, 3)
-        self._pin_indices = np.empty(0, dtype=np.int32)
+        self._pin_indices = _pin_indices_neck_collar(q0, edge_med)
+        self._pin_targets = q0[self._pin_indices].astype(np.float32).copy()
 
         # ---- solver -----------------------------------------------------
-        # Self-collision ON, static-shape contact OFF.  See the
-        # "Why self_collision_thickness needs care here" block at the
-        # top of this file for the reasoning behind the thickness pick.
-        # Narrow-phase contact buffer factor 16 (~100k cap) is plenty
-        # for ~6 k particles even when the cloth is heavily folded;
-        # broad-phase EF candidate factor 64 leaves headroom for
-        # dense pile-ups.
-        self_collision_thickness = 1.0e-3            # 1 mm (see file header)
+        # Proximity k = 1e3; untangle k = 2e3 (see file header).  Thickness 1 mm.
+        self_collision_thickness = 1.0e-3  # [m]
+        self_collision_stiffness = 1.0e3
+        untangle_stiffness = 2.0 * self_collision_stiffness
 
         self.solver = newton.solvers.SolverChysX(
             self.model,
+            gravity=(0.0, 0.0, -9.81),
             damping=0.05,
             fem_stretch_stiffness=5.0e2,
             fem_shear_stiffness=5.0e2,
             bending_stiffness=5.0e-4,
             pcg_iterations=50,
             surface_density=0.3,
-            # No pins -- garment is fully free (see __init__ docstring).
-            pin_indices=None,
+            pin_indices=self._pin_indices.tolist(),
+            pin_stiffness=1.0e9,
             self_collision_enabled=True,
             self_collision_thickness=self_collision_thickness,
-            self_collision_stiffness=1.0e3,
-            self_collision_max_contacts_factor=16,
-            self_collision_max_ef_candidates_factor=64,
+            self_collision_stiffness=self_collision_stiffness,
+            self_collision_max_contacts_factor=32,
+            self_collision_max_ef_candidates_factor=128,
             static_contact_enabled=False,
+            untangle_enabled=True,
+            untangle_thickness=self_collision_thickness,
+            untangle_stiffness=untangle_stiffness,
+            untangle_max_contacts_factor=32,
         )
 
-        # Snapshot the rest panel separation along the asset's z axis
-        # so test_final can compare end-of-run panel width against the
-        # initial value.
+        self.solver.update_pin_targets(self._pin_targets)
+
         self._initial_z_extent = float(q0[:, 2].max() - q0[:, 2].min())
         print(
             f"[chysx_tshirt_hanging] bending dihedrals: "
             f"{self.solver._sim.num_bending_dihedrals()};  "
-            f"initial panel sep (z extent) = {self._initial_z_extent:.3f} m"
+            f"pinned={len(self._pin_indices)} verts;  "
+            f"initial panel sep (z extent) = {self._initial_z_extent:.3f} m;  "
+            f"self_k={self_collision_stiffness:g}, "
+            f"untangle_k={untangle_stiffness:g}, "
+            f"thickness={self_collision_thickness:g} m"
         )
 
         self.state_0 = self.model.state()
@@ -196,15 +225,26 @@ class Example:
         self.control = self.model.control()
         self.contacts = self.model.contacts()
 
+        self._cloth_tris = tris.copy()
+
         self.viewer.set_model(self.model)
-        # Camera looking at the garment dead-on from the +X / -Y
-        # quadrant so the front and back panels are both legible
-        # without any hanging swing offsetting the framing.
-        self.viewer.set_camera(
-            pos=wp.vec3(1.4, -1.4, hang_height + 0.1),
-            pitch=-5.0,
-            yaw=45.0,
-        )
+        bmin = q0.min(axis=0).astype(np.float64)
+        bmax = q0.max(axis=0).astype(np.float64)
+        frame_z_up_camera_viewer(self.viewer, bmin, bmax)
+
+        # ---- OBJ export (optional) -------------------------------------
+        obj_out = getattr(args, "obj_out", None)
+        self._obj_dir: str | None = None
+        self._obj_stride = max(1, int(getattr(args, "obj_stride", 1)))
+        self._frame_idx = 0
+        if obj_out:
+            self._obj_dir = os.path.abspath(str(obj_out))
+            os.makedirs(self._obj_dir, exist_ok=True)
+            print(
+                f"[chysx_tshirt_hanging] OBJ export enabled -> {self._obj_dir}  "
+                f"(stride {self._obj_stride})"
+            )
+            self._export_obj_frame(0)
 
         # ---- CUDA Graph capture ----------------------------------------
         self._cuda_graph = None
@@ -238,9 +278,10 @@ class Example:
         # generates, before the garment has had a chance to deform.
         try:
             n_initial = int(self.solver._sim.self_collision_count())
+            n_utg = int(self.solver._sim.untangle_count())
             print(
-                f"[chysx_tshirt_hanging] self-contacts after warm-up "
-                f"step (rest pose): {n_initial}"
+                f"[chysx_tshirt_hanging] after warm-up: "
+                f"self_collision={n_initial}  untangle={n_utg}"
             )
         except Exception:
             pass
@@ -255,6 +296,23 @@ class Example:
         else:
             self._simulate_substeps()
         self.sim_time += self.sim_substeps * self.sim_dt
+        self._frame_idx += 1
+        if self._obj_dir is not None and (self._frame_idx % self._obj_stride) == 0:
+            self._export_obj_frame(self._frame_idx)
+
+    def _export_obj_frame(self, frame_idx: int) -> None:
+        """Write one Wavefront OBJ for the current cloth state."""
+
+        assert self._obj_dir is not None
+        q = self.state_0.particle_q.numpy().reshape(-1, 3)
+        path = os.path.join(self._obj_dir, f"tshirt_hanging_{frame_idx:05d}.obj")
+        with open(path, "w") as f:
+            f.write(
+                f"# chysx_tshirt_hanging frame {frame_idx}, "
+                f"t = {self.sim_time:.6f} s\n"
+            )
+            np.savetxt(f, q, fmt="v %.6f %.6f %.6f")
+            np.savetxt(f, self._cloth_tris + 1, fmt="f %d %d %d")
 
     def render(self):
         self.viewer.begin_frame(self.sim_time)
@@ -264,21 +322,7 @@ class Example:
     # ---- regression check --------------------------------------------
 
     def test_final(self):
-        """Sanity-check the post-roll state.
-
-        Without gravity or pins the garment should sit (almost)
-        perfectly still, so the regression checks we can do are
-        much tighter than the gravity-on variant:
-
-        * particle state stays finite,
-        * the garment stays inside a 5 m bbox (no fly-aways),
-        * the front-back panel separation hasn't collapsed to less
-          than 50 % of the initial value (which would indicate that
-          bending rest angles weren't preserved),
-        * **no particle exceeds 1 m/s** -- pure self-contact on a
-          rest pose has no energy source, so any non-trivial speed
-          here is a self-collision artefact.
-        """
+        """Sanity-check the post-roll state under gravity + contacts."""
 
         q = self.state_0.particle_q.numpy().reshape(-1, 3)
         qd = self.state_0.particle_qd.numpy().reshape(-1, 3)
@@ -286,50 +330,64 @@ class Example:
         if not (np.isfinite(q).all() and np.isfinite(qd).all()):
             raise ValueError("non-finite values in particle state")
 
-        # Diagnostic summary -- the whole point of this scene is to
-        # see how big the spurious self-contact drift is, so dump a
-        # one-liner before the threshold checks.
         com = q.mean(axis=0)
         speed = np.linalg.norm(qd, axis=1)
         z_extent_final = float(q[:, 2].max() - q[:, 2].min())
         try:
             n_contacts = int(self.solver._sim.self_collision_count())
+            n_utg = int(self.solver._sim.untangle_count())
         except Exception:
             n_contacts = -1
+            n_utg = -1
         print(
             f"[chysx_tshirt_hanging] final: "
             f"CoM=({com[0]:+.4f},{com[1]:+.4f},{com[2]:+.4f}) m,  "
             f"|v| max={float(speed.max()):.4f} mean={float(speed.mean()):.4f} m/s,  "
             f"z extent {self._initial_z_extent:.4f} -> {z_extent_final:.4f} m,  "
-            f"self_contacts={n_contacts}"
+            f"self_collision={n_contacts}  untangle={n_utg}"
         )
 
-        bound = 5.0
+        bound = 10.0
         if (np.abs(q) > bound).any():
             raise ValueError(
                 f"T-shirt particles escaped the {bound:.1f} m bbox; "
                 f"max |q| = {float(np.abs(q).max()):.3f}"
             )
 
-        if z_extent_final < 0.5 * self._initial_z_extent:
+        max_speed = float(np.linalg.norm(qd, axis=1).max())
+        if max_speed > 50.0:
             raise ValueError(
-                "panel separation collapsed past 50 % of initial -- "
-                "bending rest angles likely lost: "
-                f"initial = {self._initial_z_extent:.3f} m, "
-                f"final = {z_extent_final:.3f} m"
+                f"particle speed exploded: max |v| = {max_speed:.3f} m/s"
             )
 
-        max_speed = float(np.linalg.norm(qd, axis=1).max())
-        if max_speed > 1.0:
+        pinned = self._pin_indices
+        err = np.linalg.norm(q[pinned] - self._pin_targets, axis=1).max()
+        if err > 5.0e-3:
             raise ValueError(
-                "particle drift in pure self-collision scene exceeds "
-                f"1 m/s -- max |v| = {max_speed:.3f} m/s"
+                f"pinned vertices drifted from targets: max |Δq| = {float(err):.4f} m"
             )
 
 
 if __name__ == "__main__":
     parser = newton.examples.create_parser()
     parser.set_defaults(num_frames=600)  # 10 s at 60 fps -- enough to settle
+    parser.add_argument(
+        "--obj-out",
+        type=str,
+        default=None,
+        metavar="DIR",
+        help=(
+            "If set, dump one Wavefront OBJ per frame into DIR "
+            "(created if missing).  Names: tshirt_hanging_<frame:05d>.obj."
+        ),
+    )
+    parser.add_argument(
+        "--obj-stride",
+        type=int,
+        default=1,
+        metavar="N",
+        help="With --obj-out, write only every N-th frame.",
+    )
 
     viewer, args = newton.examples.init(parser)
     newton.examples.run(Example(viewer, args), args)

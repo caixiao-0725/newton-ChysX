@@ -33,9 +33,9 @@ class Example:
         # Simulation parameters
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
-        self.sim_substeps = 20
+        self.sim_substeps = 4
         self.sim_dt = self.frame_dt / self.sim_substeps
-        self.iterations = 10
+        self.iterations = 15
 
         # Standard poker card dimensions in meters
         self.card_width = 0.0635  # m (6.35 cm / 2.5 inches)
@@ -48,7 +48,7 @@ class Example:
         self.cell_y = self.card_height / self.dim_y  # ~0.0148 m
 
         # Number of cards: 52 (13 ranks x 4 suits)
-        self.num_cards = 52
+        self.num_cards = 3
 
         # Cube (table/platform) parameters in meters
         self.cube_size = 0.1  # m (10 cm) - half-size of the cube

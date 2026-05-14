@@ -761,13 +761,22 @@ void ClothSimulator::step(float dt, std::uintptr_t cuda_stream) {
         }
 
         // Static-shape contact (cloth ⇄ planes / boxes).  Detect at
-        // x_n (same rationale as self-collision) and scatter the
-        // penalty gradient onto the RHS now; the diagonal half is
-        // baked later in step block 5, after H_.set_zero().
+        // x_n (same rationale as self-collision), passing in the
+        // current velocity buffer so the IPC-style Coulomb friction
+        // can compute its lagged tangential slip
+        // `u_t = (v - n (n·v)) * dt`.  The penalty gradient is
+        // scattered onto the RHS now; the diagonal half (normal
+        // Gauss-Newton block + α·(I−nnᵀ) friction block) is baked
+        // later in step block 5, after H_.set_zero().
         if (static_contacts_.active()) {
             CHYSX_NVTX_RANGE_COLOUR("step::static_contact_detect",
                                     0xffc0392b);
-            static_contacts_.detect(x_n_.gpu_data(), n, cuda_stream);
+            static_contacts_.detect(
+                x_n_.gpu_data(),
+                n,
+                cuda_stream,
+                reinterpret_cast<const math::Vec3f*>(buffers_.vel.data()),
+                dt);
             static_contacts_.accumulate_gradient(
                 rhs_.gpu_data(), n, cuda_stream);
         }

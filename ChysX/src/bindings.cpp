@@ -554,12 +554,22 @@ uses identity (``ex=(1,0,0)``, ``ey=(0,1,0)``, ``ez=(0,0,1)``).
              "Currently configured static-shape contact stiffness.")
         .def("set_static_contact_friction",
              &chysx::cloth::ClothSimulator::set_static_contact_friction,
-             py::arg("mu_v"),
-             "Viscous tangential friction coefficient ``μ_v`` [N·s/m].  "
-             "Zero disables friction.")
+             py::arg("mu"),
+             "Coulomb friction coefficient ``μ`` (dimensionless).  Adds a "
+             "Lagged-Newton IPC isotropic Coulomb friction block to A's "
+             "diagonal that self-caps at ``μ · f_n``.  Zero disables friction.")
         .def("static_contact_friction",
              &chysx::cloth::ClothSimulator::static_contact_friction,
-             "Currently configured static-shape viscous friction coefficient.")
+             "Currently configured static-shape Coulomb friction coefficient.")
+        .def("set_static_contact_friction_epsilon",
+             &chysx::cloth::ClothSimulator::set_static_contact_friction_epsilon,
+             py::arg("eps_u"),
+             "Tangential slip regularisation distance ``ε_u`` [m] for the "
+             "Coulomb friction model (default 1e-4).  Smaller values stick "
+             "harder; larger values produce a softer ramp-up to the cone.")
+        .def("static_contact_friction_epsilon",
+             &chysx::cloth::ClothSimulator::static_contact_friction_epsilon,
+             "Currently configured static-shape friction regularisation ``ε_u``.")
         .def("static_plane_count",
              &chysx::cloth::ClothSimulator::static_plane_count,
              "Number of registered static planes.")

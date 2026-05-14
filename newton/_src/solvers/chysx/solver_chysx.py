@@ -200,15 +200,33 @@ class SolverChysX(SolverBase):
             reasonable starting value for a stiff ground that
             shouldn't visibly compress; raise for an even harder
             response at the cost of PCG conditioning.
-        static_contact_friction: Viscous tangential friction
-            coefficient ``μ_v`` [N·s/m] for static-shape contacts.
-            For every active contact the implicit-Euler Hessian
-            picks up an extra block ``(μ_v / dt) * (I - n n^T)``
-            that drives the tangential velocity towards zero --
-            visually equivalent to dry friction without the cost of
-            a Coulomb-cone projection.  Zero (default) disables
-            friction; values around ``surface_density * area``
-            give visibly "grippy" cloth.
+        static_contact_friction: Coulomb friction coefficient
+            ``μ`` (dimensionless) for static-shape contacts.  For
+            every active contact the implicit-Euler Hessian picks up
+            an extra block ``α · (I - n n^T)`` with
+            ``α = μ · f_n · f1_SF_over_x(‖u_t,lag‖)`` -- the
+            Lagged-Newton linearisation of IPC isotropic Coulomb
+            friction (Li et al. 2020).  At convergence the resulting
+            tangential force satisfies ``‖f_t‖ ≤ μ · f_n``
+            automatically (no explicit cone projection step), so
+            unlike the previous viscous formulation
+            (``μ_v`` [N·s/m] -> ``(μ_v/dt) (I - n n^T)``) the
+            diagonal contribution stays bounded as ``dt`` shrinks
+            and the implicit step does not need a tiny ``dt`` to
+            stay well-conditioned.  Typical cloth-on-cloth values
+            sit around ``0.3`` (cotton-on-cotton); raise toward
+            ``0.6`` for a sticky desk-mat feel.  Zero (default)
+            disables friction.
+        static_contact_friction_epsilon: Tangential slip
+            regularisation distance ``ε_u`` [m] for the Coulomb
+            friction model.  Tangential displacements smaller than
+            ``ε_u`` produce a force linear in ``dx_t`` (sticking
+            band, stiffness ``μ·f_n / ε_u``); beyond ``ε_u`` the
+            force saturates at the Coulomb limit ``μ·f_n``.
+            Default ``1e-4`` m is a good starting point for
+            cloth-on-table contact at millimetre cell sizes; pick
+            comparable to ``static_contact_thickness`` if you want
+            the sticking band to match the contact band.
         untangle_enabled: When ``True``, run the 5-vertex
             edge-face tangle pass after proximity self-collision.
             For every (edge, face) pair where the edge has actually
@@ -269,6 +287,7 @@ class SolverChysX(SolverBase):
         static_contact_thickness: float = 0.0,
         static_contact_stiffness: float = 1.0e4,
         static_contact_friction: float = 0.0,
+        static_contact_friction_epsilon: float = 1.0e-4,
         untangle_enabled: bool = False,
         untangle_thickness: float = 0.0,
         untangle_stiffness: float = 2.0e3,
@@ -482,9 +501,17 @@ class SolverChysX(SolverBase):
                     "to the cloth's typical edge length (e.g. 5e-3 for a "
                     "1 m square cloth at 21x21 resolution)."
                 )
+            if static_contact_friction_epsilon <= 0.0:
+                raise ValueError(
+                    "SolverChysX: static_contact_friction_epsilon must be "
+                    "positive (it is the IPC slip regularisation distance)."
+                )
             self._sim.set_static_contact_thickness(float(static_contact_thickness))
             self._sim.set_static_contact_stiffness(float(static_contact_stiffness))
             self._sim.set_static_contact_friction(float(static_contact_friction))
+            self._sim.set_static_contact_friction_epsilon(
+                float(static_contact_friction_epsilon)
+            )
             self._register_static_shapes_from_model()
 
     def _register_static_shapes_from_model(self) -> None:
