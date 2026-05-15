@@ -208,7 +208,7 @@ class Example:
         self._small_size = 0.14
         self._small_n = int(getattr(args, "small_n", 17))   # ~9 mm cells
         self._num_small = num_small
-        self._base_z = 0.25  # rest height of the suspended sheet [m]
+        self._base_z = 0.08  # rest height of the suspended sheet [m]
 
         # Small patches hug the base sheet but must start *outside* the
         # contact buffer (~ 2 * self_thickness ~ 9 mm with the params below).
@@ -216,8 +216,8 @@ class Example:
         # particle and excites the high-freq buzz that this example used to
         # show.  3 cm clearance + 1 cm per-layer stagger keeps every pair of
         # vertices at least one buffer width apart at rest.
-        _clear = 0.030  # [m]
-        _dz = 0.010  # [m] between consecutive falling sheets
+        _clear = 0.015  # [m]
+        _dz = 0.006  # [m] between consecutive falling sheets
 
         verts, tris, pin_idx = _build_merged_scene(
             base_size=self._base_size,
@@ -278,9 +278,11 @@ class Example:
         # Coulomb friction is now POSITIVE (the C++ side guards `μ > 0`,
         # so the previous -0.35 was silently disabling friction and
         # letting layers slide-rock on the base sheet).
+        # MODIFIED: Changed to positive value to enable friction with
+        # the new RHS force implementation.
         sc_k = 1.0e2
-        untangle_k = 0.0 * sc_k
-        static_friction = 0.35
+        untangle_k = 3.0 * sc_k
+        static_friction = 0.15  # Enable friction for testing
 
         self.solver = newton.solvers.SolverChysX(
             self.model,

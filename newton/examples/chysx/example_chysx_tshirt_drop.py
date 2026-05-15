@@ -206,7 +206,7 @@ class Example:
         # rather than sliding off; the bound ``‖f_t‖ ≤ μ·f_n`` keeps the
         # tangential block from over-stiffening even with the example's
         # generous ``dt = 10 ms`` (one substep at 100 fps).
-        static_friction = -0.3
+        static_friction = 0.03
 
         # Narrow-phase contact buffer.  ~6.4 k particles, expect
         # at most ~5 k VF/EE pairs at full collapse, so factor 8

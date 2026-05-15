@@ -225,7 +225,7 @@ class Example:
         # scale the other chysx examples are tuned around.
         self._n_patches = 2
         self._patch_size = 0.3
-        self._n_per_side = 11
+        self._n_per_side = 101
         edge_l = self._patch_size / (self._n_per_side - 1)
         self._edge_l = edge_l
 
@@ -314,7 +314,7 @@ class Example:
         # diagonal) was not -- raise μ here all the way to 1.0
         # without re-tuning ``sim_substeps`` and the simulation
         # remains stable.
-        static_friction = -0.01               # dimensionless Coulomb μ
+        static_friction = 0.3               # dimensionless Coulomb μ
 
         # Untangle: same thickness band as proximity self-collision.
         # Use stiffness equal to self-collision here (not the usual 2×

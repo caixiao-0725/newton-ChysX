@@ -164,37 +164,6 @@ __global__ void detect_kernel(
     }
 }
 
-// rhs[p] += -k * depth * n.   No atomic — each particle gets exactly
-// one contact at most so there is no cross-thread contention; the
-// pre-existing rhs value (gradient from elastic / pin / etc.) gets
-// read once and written once per particle.
-//
-// Friction does not contribute to the gradient here: in the
-// stiffness-only IPC-Coulomb formulation the tangential force is
-// `f_t = -α · dx_t` with the unknown `dx_t` (the displacement we are
-// solving for), so the contribution lives entirely on A's diagonal
-// (see `bake_diag_kernel`).  At convergence the Newton step picks up
-// the right `dx_t`, the diagonal block produces the matching
-// tangential reaction, and no zero-iteration RHS contribution is
-// required.
-__global__ void scatter_gradient_kernel(
-    const math::Vec4f* __restrict__ contacts,
-    int                             n_particles,
-    float                           stiffness,
-    math::Vec3f* __restrict__       rhs) {
-    const int p = blockIdx.x * blockDim.x + threadIdx.x;
-    if (p >= n_particles) return;
-
-    const math::Vec4f c = contacts[p];
-    const float depth = c.w;
-    if (depth <= 0.0f) return;
-
-    const float kd = -stiffness * depth;
-    rhs[p].x += kd * c.x;
-    rhs[p].y += kd * c.y;
-    rhs[p].z += kd * c.z;
-}
-
 // IPC-style smoothing of `1 / ‖u_t‖`.  Linear ramp inside the
 // regularisation band so that `‖f_t‖ → 0` as `‖u_t‖ → 0` (no spurious
 // tangential force at standstill); plain `1/‖u_t‖` outside the band
@@ -209,6 +178,54 @@ __device__ inline float f1_sf_over_x(float u_norm, float eps_u) {
     // (largest), at u_norm = eps_u it matches the outer branch
     // (1/eps_u) so the function is C0-continuous.
     return (-u_norm / eps_u + 2.0f) / eps_u;
+}
+
+// rhs[p] += -k * depth * n  +  (-α * u_t^lag).
+//
+// No atomic — each particle gets exactly one contact at most so there
+// is no cross-thread contention; the pre-existing rhs value (gradient
+// from elastic / pin / etc.) gets read once and written once per
+// particle.
+//
+// MODIFIED: Now includes tangential friction force in RHS for improved
+// stability.  The tangential force is `-α · u_t^lag` where `u_t^lag`
+// is the lagged tangential slip from the previous step (computed in
+// `detect_kernel`).  This provides explicit damping based on the
+// previous motion, while the diagonal block `α · (I - n n^T)` in
+// `bake_diag_kernel` provides implicit stiffness.  Together they form
+// a spring-damper system that is more stable than stiffness-only.
+__global__ void scatter_gradient_kernel(
+    const math::Vec4f* __restrict__ contacts,
+    const math::Vec4f* __restrict__ slips,
+    int                             n_particles,
+    float                           stiffness,
+    float                           friction_mu,
+    float                           friction_epsilon,
+    math::Vec3f* __restrict__       rhs) {
+    const int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= n_particles) return;
+
+    const math::Vec4f c = contacts[p];
+    const float depth = c.w;
+    if (depth <= 0.0f) return;
+
+    // Normal force: -k * depth * n
+    const float kd = -stiffness * depth;
+    rhs[p].x += kd * c.x;
+    rhs[p].y += kd * c.y;
+    rhs[p].z += kd * c.z;
+
+    // Tangential friction force: -α * u_t^lag
+    if (friction_mu > 0.0f && slips != nullptr) {
+        const float f_n = stiffness * depth;
+        const math::Vec4f slip = slips[p];
+        const float u_norm = slip.w;
+        const float f1 = f1_sf_over_x(u_norm, friction_epsilon);
+        const float alpha = friction_mu * f_n * f1;
+        rhs[p].x += -alpha * slip.x;
+        rhs[p].y += -alpha * slip.y;
+        rhs[p].z += -alpha * slip.z;
+    }
 }
 
 // diag[p] += k_n * (n n^T)  +  α_p * (I - n n^T).
@@ -380,8 +397,16 @@ void StaticContactSet::accumulate_gradient(math::Vec3f*    rhs,
     if (cached_n_particles_ != n_particles) return;
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+    const math::Vec4f* slip_ptr =
+        (friction_ > 0.0f && cached_has_slip_) ? slips_.gpu_data() : nullptr;
     scatter_gradient_kernel<<<grid_for(n_particles), kBlockDim, 0, stream>>>(
-        contacts_.gpu_data(), n_particles, stiffness_, rhs);
+        contacts_.gpu_data(),
+        slip_ptr,
+        n_particles,
+        stiffness_,
+        friction_,
+        friction_epsilon_,
+        rhs);
     check_cuda(cudaGetLastError(), "scatter_gradient_kernel launch");
 }
 
