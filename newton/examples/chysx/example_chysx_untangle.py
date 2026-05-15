@@ -229,7 +229,7 @@ class Example:
         # (style3d uses 6 mm = 2*radius; same order of magnitude).
         thickness = 1.0e-2
         sc_stiffness = 1.0e2     # style3d-equivalent VF factor (cuda-cloth m_4_k)
-        utg_stiffness = 2.0e2    # 2x sc_stiffness, matches style3d EF/VF ratio
+        utg_stiffness = 2*sc_stiffness    # 2x sc_stiffness, matches style3d EF/VF ratio
 
         # Buffer caps.  The pre-tangled rest pose has thousands of EF
         # candidates; size generously so the broadphase never clips.
