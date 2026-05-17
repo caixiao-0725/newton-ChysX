@@ -302,6 +302,92 @@ __global__ void bake_diag_kernel(
     A.data[8] += a22;
 }
 
+// Coulomb-cone projection on the assembled Newton residual.
+//
+// At entry `rhs[p]` already contains  F0  +  F_N  (where
+// F_N = +k·depth·n is the penalty normal push the gradient pass added,
+// and F0 = inertia + (-elastic_grad) is everything else).  We
+// reconstruct F0, estimate the normal load that F0 itself imparts on
+// the boundary, and then bend `rhs` so the tangential component lands
+// inside the Coulomb cone of radius μ·f_n_mag:
+//
+//     F0          = rhs - k·depth·n
+//     F0_n_scalar = dot(F0, n)
+//     f_n_mag     = max(0, -F0_n_scalar)              (push *into* wall)
+//     F0_t        = F0 - F0_n_scalar · n
+//     ‖F0_t‖     = F_T
+//     cone        = μ · f_n_mag
+//
+// Then:
+//     stick  (F_T ≤ cone):    Δf = -F0_t
+//     slip   (F_T >  cone):   Δf = -cone · F0_t / F_T
+//
+// `rhs[p] += Δf`.  This is purely an RHS modification — no Hessian
+// term — and is *additive* on top of the IPC stiffness friction
+// already baked into `H_.diag` by `bake_diag_kernel`.
+//
+// Single writer per particle (each particle's rhs cell is owned by
+// this thread) ⇒ no atomics needed, same property as the other
+// scatter passes in this file.
+__global__ void apply_coulomb_friction_kernel(
+    const math::Vec4f* __restrict__ contacts,
+    int                             n_particles,
+    float                           stiffness,
+    float                           friction_mu,
+    math::Vec3f* __restrict__       rhs) {
+    const int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= n_particles) return;
+
+    const math::Vec4f c = contacts[p];
+    const float depth = c.w;
+    if (depth <= 0.0f) return;
+    if (friction_mu <= 0.0f) return;
+
+    const float nx = c.x;
+    const float ny = c.y;
+    const float nz = c.z;
+
+    // Reconstruct F0 by subtracting the penalty normal push that the
+    // gradient stage already folded into rhs (rhs += +k·depth·n,
+    // because assemble_rhs flips the sign of the accumulated gradient
+    // -k·depth·n).
+    const float fn_push = stiffness * depth;       // = ‖F_N‖
+    const math::Vec3f r = rhs[p];
+    const math::Vec3f F0(r.x - fn_push * nx,
+                         r.y - fn_push * ny,
+                         r.z - fn_push * nz);
+
+    // Cone radius: only the part of F0 pushing INTO the wall counts
+    // as the normal load.  If the inertial+elastic force is pulling
+    // the particle *away* from the wall (F0·n > 0, i.e. -F0·n < 0),
+    // there is no normal load and no friction is allowed.
+    const float F0_n_scalar = F0.x * nx + F0.y * ny + F0.z * nz;
+    const float f_n_mag     = fmaxf(0.0f, -F0_n_scalar);
+    if (f_n_mag <= 0.0f) return;
+
+    const math::Vec3f F0_t(F0.x - F0_n_scalar * nx,
+                           F0.y - F0_n_scalar * ny,
+                           F0.z - F0_n_scalar * nz);
+    const float F_T_sq = F0_t.x * F0_t.x + F0_t.y * F0_t.y + F0_t.z * F0_t.z;
+    if (F_T_sq <= 0.0f) return;
+    const float F_T = sqrtf(F_T_sq);
+
+    const float cone = friction_mu * f_n_mag;
+
+    if (F_T <= cone) {
+        // Stick: friction force exactly cancels F0's tangential part.
+        rhs[p].x -= F0_t.x;
+        rhs[p].y -= F0_t.y;
+        rhs[p].z -= F0_t.z;
+    } else {
+        // Slip: shrink F0_t by the cone radius along its own direction.
+        const float shrink = cone / F_T;            // < 1
+        rhs[p].x -= shrink * F0_t.x;
+        rhs[p].y -= shrink * F0_t.y;
+        rhs[p].z -= shrink * F0_t.z;
+    }
+}
+
 }  // namespace
 
 void StaticContactSet::clear() {
@@ -408,6 +494,23 @@ void StaticContactSet::accumulate_gradient(math::Vec3f*    rhs,
         friction_epsilon_,
         rhs);
     check_cuda(cudaGetLastError(), "scatter_gradient_kernel launch");
+}
+
+void StaticContactSet::apply_coulomb_friction(math::Vec3f*   rhs,
+                                              int             n_particles,
+                                              std::uintptr_t  cuda_stream) const {
+    if (!active() || n_particles <= 0) return;
+    if (cached_n_particles_ != n_particles) return;
+    if (friction_ <= 0.0f) return;
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+    apply_coulomb_friction_kernel<<<grid_for(n_particles), kBlockDim, 0, stream>>>(
+        contacts_.gpu_data(),
+        n_particles,
+        stiffness_,
+        friction_,
+        rhs);
+    check_cuda(cudaGetLastError(), "apply_coulomb_friction_kernel launch");
 }
 
 void StaticContactSet::bake_diag(math::Mat3f*   diag,

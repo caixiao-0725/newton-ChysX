@@ -314,7 +314,7 @@ class Example:
         # diagonal) was not -- raise μ here all the way to 1.0
         # without re-tuning ``sim_substeps`` and the simulation
         # remains stable.
-        static_friction = 0.3               # dimensionless Coulomb μ
+        static_friction = 0.4               # dimensionless Coulomb μ
 
         # Untangle: same thickness band as proximity self-collision.
         # Use stiffness equal to self-collision here (not the usual 2×

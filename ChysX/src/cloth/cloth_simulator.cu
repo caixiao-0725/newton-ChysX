@@ -792,6 +792,23 @@ void ClothSimulator::step(float dt, std::uintptr_t cuda_stream) {
             reinterpret_cast<float3*>(rhs_.gpu_data()),
             n, inv_dt2);
         check_cuda(cudaGetLastError(), "assemble_rhs kernel launch");
+
+        // Coulomb-cone projection of the assembled Newton residual
+        // against the static-contact normals.  Runs HERE — after
+        // assemble_rhs has flipped the sign of g and added the
+        // inertial term — because that is the moment when rhs[p]
+        // first equals F_total = inertia + (-elastic_grad) + F_N.
+        // The projection internally subtracts the F_N it knows about
+        // (k·depth·n) to recover F0 = inertia + (-elastic_grad), then
+        // bends rhs so the tangential force lands inside μ·‖F0_n‖.
+        // Additive on top of the IPC stiffness friction baked in step
+        // block 5 — a no-op when friction() == 0.
+        if (static_contacts_.active()) {
+            CHYSX_NVTX_RANGE_COLOUR("step::static_contact_friction",
+                                    0xffe74c3c);
+            static_contacts_.apply_coulomb_friction(
+                rhs_.gpu_data(), n, cuda_stream);
+        }
     }
 
     // ---- 4) (re)build Hessian topology if anything changed ----------

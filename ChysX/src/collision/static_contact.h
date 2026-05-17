@@ -232,6 +232,53 @@ public:
                    float           dt,
                    std::uintptr_t  cuda_stream = 0) const;
 
+    // Coulomb-cone post-projection of the assembled Newton residual.
+    //
+    // To be called *after* `assemble_rhs_kernel` (and after this
+    // class' own `accumulate_gradient`).  At that point the per-
+    // particle right-hand side equals
+    //
+    //     rhs[p] = M_p · v_pred / dt  -  ∇E_elastic(x_n)
+    //              + k · depth_p · n_p          (penalty normal push)
+    //
+    // i.e. it is the *force* the linear solve will see (sign flipped
+    // from the gradient stage).  We reconstruct the user's "F0" — the
+    // inertial + elastic force, *without* the penalty normal — by
+    // subtracting the penalty contribution we just added:
+    //
+    //     F0_p = rhs[p] - k · depth_p · n_p.
+    //
+    // The friction normal load is then estimated from F0's component
+    // pushing into the boundary:
+    //
+    //     f_n_mag = max(0, -dot(F0_p, n_p)).
+    //
+    // (Using `f_n_mag = k · depth_p` would couple the cone radius to
+    // a transient penalty depth that has not yet been resisted; using
+    // the inertial-elastic load is what physical Coulomb friction
+    // measures and is what cuda-cloth's friction project also does.)
+    //
+    // The Coulomb-cone projection then operates on F0's tangential
+    // component `F0_t = F0 - dot(F0, n) · n`:
+    //
+    //     stick (‖F0_t‖ ≤ μ · f_n_mag):  Δf = -F0_t       — cancels slip
+    //     slip  (‖F0_t‖ >  μ · f_n_mag): Δf = -μ · f_n_mag · F0_t/‖F0_t‖
+    //
+    // and adds `Δf` to `rhs[p]`.  This is *additive* on top of the
+    // IPC-style stiffness friction baked by `bake_diag` — the IPC
+    // term acts as implicit damping in the linear system, while this
+    // pass strictly enforces the Coulomb cone on the assembled force.
+    //
+    // No-op when `friction() <= 0`, when there is no active contact at
+    // a particle, or when F0 is pulling the particle *away* from the
+    // boundary (`f_n_mag = 0` ⇒ no friction allowed).
+    //
+    // Same precondition as `accumulate_gradient` — call with the same
+    // `n_particles` that `detect()` last saw.
+    void apply_coulomb_friction(math::Vec3f*    rhs,
+                                int             n_particles,
+                                std::uintptr_t  cuda_stream = 0) const;
+
 private:
     void upload_shapes_();
 
