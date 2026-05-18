@@ -602,21 +602,47 @@ uses identity (``ex=(1,0,0)``, ``ey=(0,1,0)``, ``ez=(0,0,1)``).
         .def("static_box_count",
              &chysx::cloth::ClothSimulator::static_box_count,
              "Number of registered static boxes.")
-        // ---- SDF-volume contact (cloth ⇄ animated implicit body) ----
+        // ---- SDF-volume contacts (cloth ⇄ animated implicit bodies) ----
+        //
+        // The simulator may hold zero, one, or many SDF bodies.  Each
+        // body is identified by a stable integer ``volume_index``
+        // returned by ``add_sdf_volume()``; pass it to every bake /
+        // pose / parameter setter.  ``volume_index = 0`` is the
+        // legacy single-body slot (no-op for users that already
+        // called ``add_sdf_volume`` exactly once at setup).
+        .def("add_sdf_volume",
+             [](chysx::cloth::ClothSimulator& s) {
+                 return s.add_sdf_volume();
+             },
+             R"pbdoc(
+Allocate a new SDF volume + contact pair and return its index.
+
+Call once per animated implicit body before any ``bake_sdf_box`` /
+``set_sdf_pose`` call.  Subsequent SDF API calls take this index as
+their first argument.  Volumes added later are appended to the
+internal vector; indices are stable for the lifetime of the
+simulator.
+)pbdoc")
+        .def("num_sdf_volumes",
+             &chysx::cloth::ClothSimulator::num_sdf_volumes,
+             "Number of SDF volumes currently held by the simulator.")
         .def(
             "bake_sdf_box",
-            [](chysx::cloth::ClothSimulator& s,
+            [](chysx::cloth::ClothSimulator& s, int volume_index,
                float hx, float hy, float hz,
-               float voxel_size, float padding) {
-                s.sdf_volume().bake_box(hx, hy, hz, voxel_size, padding);
+               float voxel_size, float padding, float corner_radius) {
+                s.sdf_volume(volume_index)
+                    .bake_box(hx, hy, hz, voxel_size, padding, corner_radius);
             },
+            py::arg("volume_index"),
             py::arg("hx"),
             py::arg("hy"),
             py::arg("hz"),
             py::arg("voxel_size"),
             py::arg("padding") = -1.0f,
+            py::arg("corner_radius") = 0.0f,
             R"pbdoc(
-Bake an analytic axis-aligned box SDF into the owned `SdfVolume`.
+Bake an analytic axis-aligned box SDF into volume ``volume_index``.
 
 The box is centred at the volume's local origin with half-extents
 ``(hx, hy, hz)``.  The grid is padded by ``padding`` on every axis so
@@ -626,6 +652,8 @@ frame motion is configured separately via ``set_sdf_pose(...)``.
 
 Parameters
 ----------
+volume_index : int
+    Index returned by a prior ``add_sdf_volume()`` call.
 hx, hy, hz : float
     Half-extents of the box along its local x/y/z axes [m].
 voxel_size : float
@@ -635,34 +663,34 @@ voxel_size : float
     of voxels per particle-thickness band is usually plenty).
 padding : float, optional
     Extra padding on every axis [m]; default is ``2 · voxel_size``.
+corner_radius : float, optional
+    Edge rounding radius [m].  ``0`` keeps sharp edges; ``>0`` bakes
+    a rounded box SDF (continuous normals around box edges/corners),
+    which is often more stable for cloth contact.
 )pbdoc")
         .def(
             "set_sdf_pose",
-            [](chysx::cloth::ClothSimulator& s,
+            [](chysx::cloth::ClothSimulator& s, int volume_index,
                py::array_t<float, py::array::c_style | py::array::forcecast> pos) {
                 if (pos.ndim() != 1 || pos.shape(0) != 3) {
                     throw std::invalid_argument(
                         "ClothSimulator.set_sdf_pose: pos must be a "
                         "(3,) float32 vector");
                 }
-                s.sdf_volume().set_pose_translation(
+                s.sdf_volume(volume_index).set_pose_translation(
                     chysx::math::Vec3f(pos.at(0), pos.at(1), pos.at(2)));
             },
+            py::arg("volume_index"),
             py::arg("pos"),
             R"pbdoc(
-Set the SDF body's world pose to a pure translation (identity
-rotation).  Use this every frame for translating bodies; combine
-with ``set_sdf_body_velocity`` so the friction slip cache uses
-relative tangential motion.
-
-Parameters
-----------
-pos : numpy.ndarray, shape (3,), dtype float32
-    World position of the body's local origin [m].
+Set volume ``volume_index``'s world pose to a pure translation
+(identity rotation).  Use this every frame for translating bodies;
+combine with ``set_sdf_body_velocity`` so the friction slip cache
+uses relative tangential motion.
 )pbdoc")
         .def(
             "set_sdf_pose_full",
-            [](chysx::cloth::ClothSimulator& s,
+            [](chysx::cloth::ClothSimulator& s, int volume_index,
                py::array_t<float, py::array::c_style | py::array::forcecast> pos,
                py::array_t<float, py::array::c_style | py::array::forcecast> ex,
                py::array_t<float, py::array::c_style | py::array::forcecast> ey,
@@ -675,95 +703,114 @@ pos : numpy.ndarray, shape (3,), dtype float32
                     }
                     return chysx::math::Vec3f(a.at(0), a.at(1), a.at(2));
                 };
-                s.sdf_volume().set_pose(v3(pos, "pos"), v3(ex, "ex"),
-                                         v3(ey, "ey"), v3(ez, "ez"));
+                s.sdf_volume(volume_index).set_pose(
+                    v3(pos, "pos"), v3(ex, "ex"),
+                    v3(ey, "ey"), v3(ez, "ez"));
             },
+            py::arg("volume_index"),
             py::arg("pos"),
             py::arg("ex"),
             py::arg("ey"),
             py::arg("ez"),
             R"pbdoc(
-Set the SDF body's full world pose: position + the three orthonormal
-column vectors of its rotation matrix.  ``(ex, ey, ez)`` map the
-body's local +x/+y/+z axes into world space.  Use the simpler
-``set_sdf_pose(pos)`` if your body never rotates.
+Set volume ``volume_index``'s full world pose: position + the three
+orthonormal column vectors of its rotation matrix.  ``(ex, ey, ez)``
+map the body's local +x/+y/+z axes into world space.  Use the
+simpler ``set_sdf_pose(...)`` if your body never rotates.
 )pbdoc")
         .def(
             "set_sdf_body_velocity",
-            [](chysx::cloth::ClothSimulator& s,
+            [](chysx::cloth::ClothSimulator& s, int volume_index,
                py::array_t<float, py::array::c_style | py::array::forcecast> v) {
                 if (v.ndim() != 1 || v.shape(0) != 3) {
                     throw std::invalid_argument(
                         "ClothSimulator.set_sdf_body_velocity: v must be a "
                         "(3,) float32 vector");
                 }
-                s.sdf_contact().set_body_velocity(
+                s.sdf_contact(volume_index).set_body_velocity(
                     chysx::math::Vec3f(v.at(0), v.at(1), v.at(2)));
             },
+            py::arg("volume_index"),
             py::arg("v"),
             R"pbdoc(
-Set the SDF body's linear velocity in world frame [m/s].  Subtracted
-from each cloth particle's velocity before projecting onto the
-contact tangent, so a particle riding the body sees zero spurious
-slip (and therefore zero spurious friction).  Default ``(0, 0, 0)``.
+Set volume ``volume_index``'s linear velocity in world frame [m/s].
+Subtracted from each cloth particle's velocity before projecting
+onto the contact tangent, so a particle riding the body sees zero
+spurious slip (and therefore zero spurious friction).  Default
+``(0, 0, 0)``.
 )pbdoc")
         .def("set_sdf_contact_thickness",
-             [](chysx::cloth::ClothSimulator& s, float t) {
-                 s.sdf_contact().set_thickness(t);
+             [](chysx::cloth::ClothSimulator& s, int volume_index, float t) {
+                 s.sdf_contact(volume_index).set_thickness(t);
              },
+             py::arg("volume_index"),
              py::arg("thickness"),
-             "Contact distance threshold ``h`` [m] for the SDF body.  "
-             "Particles with ``sdf(x) < h`` are in contact.")
+             "Contact distance threshold ``h`` [m] for SDF body "
+             "``volume_index``.  Particles with ``sdf(x) < h`` are "
+             "in contact.")
         .def("sdf_contact_thickness",
-             [](const chysx::cloth::ClothSimulator& s) {
-                 return s.sdf_contact().thickness();
+             [](const chysx::cloth::ClothSimulator& s, int volume_index) {
+                 return s.sdf_contact(volume_index).thickness();
              },
-             "Currently configured SDF contact thickness.")
+             py::arg("volume_index"),
+             "Currently configured SDF contact thickness for the body.")
         .def("set_sdf_contact_stiffness",
-             [](chysx::cloth::ClothSimulator& s, float k) {
-                 s.sdf_contact().set_stiffness(k);
+             [](chysx::cloth::ClothSimulator& s, int volume_index, float k) {
+                 s.sdf_contact(volume_index).set_stiffness(k);
              },
+             py::arg("volume_index"),
              py::arg("stiffness"),
-             "Per-contact penalty stiffness ``k`` [N/m] for the SDF body.")
+             "Per-contact penalty stiffness ``k`` [N/m] for SDF body "
+             "``volume_index``.")
         .def("sdf_contact_stiffness",
-             [](const chysx::cloth::ClothSimulator& s) {
-                 return s.sdf_contact().stiffness();
+             [](const chysx::cloth::ClothSimulator& s, int volume_index) {
+                 return s.sdf_contact(volume_index).stiffness();
              },
-             "Currently configured SDF contact stiffness.")
+             py::arg("volume_index"),
+             "Currently configured SDF contact stiffness for the body.")
         .def("set_sdf_contact_friction",
-             [](chysx::cloth::ClothSimulator& s, float mu) {
-                 s.sdf_contact().set_friction(mu);
+             [](chysx::cloth::ClothSimulator& s, int volume_index, float mu) {
+                 s.sdf_contact(volume_index).set_friction(mu);
              },
+             py::arg("volume_index"),
              py::arg("mu"),
              "IPC-style Coulomb friction coefficient ``μ`` "
-             "(dimensionless) for the SDF body.  Zero disables friction.")
+             "(dimensionless) for SDF body ``volume_index``.  Zero "
+             "disables friction.")
         .def("sdf_contact_friction",
-             [](const chysx::cloth::ClothSimulator& s) {
-                 return s.sdf_contact().friction();
+             [](const chysx::cloth::ClothSimulator& s, int volume_index) {
+                 return s.sdf_contact(volume_index).friction();
              },
+             py::arg("volume_index"),
              "Currently configured SDF Coulomb friction coefficient.")
         .def("set_sdf_contact_friction_epsilon",
-             [](chysx::cloth::ClothSimulator& s, float eps_u) {
-                 s.sdf_contact().set_friction_epsilon(eps_u);
+             [](chysx::cloth::ClothSimulator& s, int volume_index, float eps_u) {
+                 s.sdf_contact(volume_index).set_friction_epsilon(eps_u);
              },
+             py::arg("volume_index"),
              py::arg("eps_u"),
              "Tangential slip regularisation distance ``ε_u`` [m] for "
-             "the SDF Coulomb friction model (default 1e-4).")
+             "SDF body ``volume_index``'s Coulomb friction model "
+             "(default 1e-4).")
         .def("sdf_contact_friction_epsilon",
-             [](const chysx::cloth::ClothSimulator& s) {
-                 return s.sdf_contact().friction_epsilon();
+             [](const chysx::cloth::ClothSimulator& s, int volume_index) {
+                 return s.sdf_contact(volume_index).friction_epsilon();
              },
+             py::arg("volume_index"),
              "Currently configured SDF friction regularisation ``ε_u``.")
         .def("sdf_volume_active",
-             [](const chysx::cloth::ClothSimulator& s) {
-                 return s.sdf_volume().active();
+             [](const chysx::cloth::ClothSimulator& s, int volume_index) {
+                 return s.sdf_volume(volume_index).active();
              },
-             "True if the SDF volume has been baked at least once.")
+             py::arg("volume_index"),
+             "True if SDF volume ``volume_index`` has been baked at "
+             "least once.")
         .def("sdf_volume_shape",
-             [](const chysx::cloth::ClothSimulator& s) {
-                 const auto& v = s.sdf_volume();
+             [](const chysx::cloth::ClothSimulator& s, int volume_index) {
+                 const auto& v = s.sdf_volume(volume_index);
                  return py::make_tuple(v.nx(), v.ny(), v.nz());
              },
+             py::arg("volume_index"),
              "(nx, ny, nz) voxel resolution of the baked SDF.")
         .def_property_readonly(
             "material",

@@ -22,6 +22,8 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
+#include <vector>
 
 #include "../collision/mesh_topology.h"
 #include "../collision/sdf/sdf_contact.h"
@@ -48,15 +50,14 @@ namespace cloth {
 
 class ClothSimulator {
 public:
-    // Bind the owned `SdfContact` to the owned `SdfVolume` at
-    // construction so the per-step pipeline can call
-    // `sdf_contact_.active()` without any further setup.  Volume
-    // stays empty (active() == false) until the caller invokes
-    // `sdf_volume().bake_box(...)` or `bake_from_host(...)`; in that
-    // dormant state the SDF pipeline is a per-step no-op.
-    ClothSimulator() {
-        sdf_contact_.bind_volume(&sdf_volume_);
-    }
+    // SDF volumes start empty.  Each call to `add_sdf_volume()`
+    // allocates a fresh (SdfVolume, SdfContact) pair and binds the
+    // latter to the former; the step pipeline iterates the vector
+    // every frame so a simulator may carry an arbitrary number of
+    // animated implicit bodies (gripper jaws, finger pads, ...).
+    // The vector stays empty in the common no-SDF case, so the SDF
+    // pipeline costs nothing for users who don't use it.
+    ClothSimulator() = default;
 
     // Move-only.  Two simulators with the same external pointers would
     // step the same particles twice, which is almost never desired.
@@ -422,36 +423,54 @@ public:
         return static_contacts_;
     }
 
-    // ---- SDF-volume contact (cloth ⇄ animated implicit body) --------
+    // ---- SDF-volume contacts (cloth ⇄ animated implicit bodies) -----
     //
-    // Penalty contact between cloth particles and an *animated*
-    // signed-distance-field body (`SdfVolume`).  Same per-particle
-    // detect / scatter / diag / cone-projection pipeline as
-    // `StaticContactSet`, but the body geometry is a baked voxel
-    // grid (arbitrary shapes via `bake_box(...)` or
-    // `bake_from_host(...)`) and the body has a per-step rigid pose +
-    // linear velocity that flows into both the contact normals and
-    // the friction slip cache.
+    // Penalty contact between cloth particles and one or more
+    // *animated* signed-distance-field bodies (`SdfVolume`).  Same
+    // per-particle detect / scatter / diag / cone-projection pipeline
+    // as `StaticContactSet`, but each body's geometry is a baked
+    // voxel grid (arbitrary shapes via `bake_box(...)` or
+    // `bake_from_host(...)`) with its own per-step rigid pose + linear
+    // velocity feeding both contact normals and the friction slip
+    // cache.
     //
-    // The simulator owns the volume and the contact set; the volume
-    // is bound to the contact at construction (no further setup
-    // needed).  Typical use:
+    // Volumes live in a `std::vector` so a simulator may carry
+    // multiple animated SDF bodies — for instance the two jaws of a
+    // gripper or the finger pads of a hand.  Each entry has its own
+    // bound `SdfContact`, so per-body thickness / stiffness / friction
+    // can be tuned independently.
     //
-    //     sim.sdf_volume().bake_box(0.3f, 0.3f, 0.05f, 0.01f);
-    //     sim.sdf_contact().set_thickness(0.003f);
-    //     sim.sdf_contact().set_stiffness(1.0e4f);
-    //     sim.sdf_contact().set_friction(0.4f);
+    //     int j0 = sim.add_sdf_volume();
+    //     int j1 = sim.add_sdf_volume();
+    //     sim.sdf_volume(j0).bake_box(0.05f, 0.10f, 0.10f, 0.0025f);
+    //     sim.sdf_volume(j1).bake_box(0.05f, 0.10f, 0.10f, 0.0025f);
+    //     sim.sdf_contact(j0).set_thickness(0.003f);  // ... etc.
     //     // ...each step:
-    //     sim.sdf_volume().set_pose_translation({0, 0, z_box});
-    //     sim.sdf_contact().set_body_velocity({0, 0, v_box});
+    //     sim.sdf_volume(j0).set_pose_translation({-0.04f, 0.0f, z});
+    //     sim.sdf_volume(j1).set_pose_translation({+0.04f, 0.0f, z});
     //
-    // The pipeline is a no-op when no volume data has been baked
-    // (`sdf_volume().active() == false`) or when stiffness == 0.
-    collision::SdfVolume& sdf_volume() noexcept { return sdf_volume_; }
-    const collision::SdfVolume& sdf_volume() const noexcept { return sdf_volume_; }
+    // The pipeline iterates the vector each frame and skips any
+    // entry whose volume is empty (`active() == false`) or whose
+    // contact stiffness is zero — so dormant bodies cost nothing.
+    int add_sdf_volume();
 
-    collision::SdfContact& sdf_contact() noexcept { return sdf_contact_; }
-    const collision::SdfContact& sdf_contact() const noexcept { return sdf_contact_; }
+    int num_sdf_volumes() const noexcept {
+        return static_cast<int>(sdf_volumes_.size());
+    }
+
+    collision::SdfVolume& sdf_volume(int i) noexcept {
+        return *sdf_volumes_[static_cast<std::size_t>(i)];
+    }
+    const collision::SdfVolume& sdf_volume(int i) const noexcept {
+        return *sdf_volumes_[static_cast<std::size_t>(i)];
+    }
+
+    collision::SdfContact& sdf_contact(int i) noexcept {
+        return *sdf_contacts_[static_cast<std::size_t>(i)];
+    }
+    const collision::SdfContact& sdf_contact(int i) const noexcept {
+        return *sdf_contacts_[static_cast<std::size_t>(i)];
+    }
 
     // ---- pin target update (no re-bind) -------------------------------
     //
@@ -580,8 +599,13 @@ private:
     bool                                  untangle_enabled_ = false;
     float                                 untangle_thickness_ = 0.0f;
     collision::StaticContactSet           static_contacts_;
-    collision::SdfVolume                  sdf_volume_;
-    collision::SdfContact                 sdf_contact_;
+    // SDF bodies: parallel vectors, sdf_contacts_[i] is bound to
+    // *sdf_volumes_[i].  Held by unique_ptr so the bound pointers
+    // remain stable across `add_sdf_volume()` (vector resize would
+    // otherwise relocate `SdfVolume` payloads, invalidating the
+    // pointer the bound `SdfContact` holds).
+    std::vector<std::unique_ptr<collision::SdfVolume>>  sdf_volumes_;
+    std::vector<std::unique_ptr<collision::SdfContact>> sdf_contacts_;
 
     // ---- implicit-Euler PCG step working state ----------------------
     //

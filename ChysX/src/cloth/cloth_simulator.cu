@@ -242,6 +242,17 @@ void ClothSimulator::set_external_buffers(std::uintptr_t pos_ptr,
     buffers_.inv_mass = DeviceSpan<float>::from_raw(inv_mass_ptr, n);
 }
 
+int ClothSimulator::add_sdf_volume() {
+    // Hold the payload behind unique_ptr so the SdfVolume's address
+    // never moves when the vector grows.  An SdfContact stores a raw
+    // SdfVolume* set at bind time; if the vector were to reallocate
+    // and relocate the SdfVolume payload, that pointer would dangle.
+    sdf_volumes_.emplace_back(std::make_unique<collision::SdfVolume>());
+    sdf_contacts_.emplace_back(std::make_unique<collision::SdfContact>());
+    sdf_contacts_.back()->bind_volume(sdf_volumes_.back().get());
+    return static_cast<int>(sdf_volumes_.size()) - 1;
+}
+
 void ClothSimulator::set_pins(const int* host_indices,
                               const math::Vec3f* host_targets,
                               int n,
@@ -791,22 +802,25 @@ void ClothSimulator::step(float dt, std::uintptr_t cuda_stream) {
                 rhs_.gpu_data(), n, cuda_stream);
         }
 
-        // SDF-volume contact (cloth ⇄ animated implicit body).  Same
-        // shape as the static-contact pass above, but the body's
+        // SDF-volume contacts (cloth ⇄ animated implicit bodies).
+        // Same shape as the static-contact pass above, but each body's
         // signed distance comes from a trilinear-sampled voxel grid
         // and its rigid pose may move between frames; the slip cache
         // uses the relative velocity `v_particle - v_body` so a
         // particle riding the body experiences zero spurious slip.
-        if (sdf_contact_.active()) {
+        // The vector loop is a no-op when no SDF bodies were added.
+        for (auto& contact_ptr : sdf_contacts_) {
+            auto& contact = *contact_ptr;
+            if (!contact.active()) continue;
             CHYSX_NVTX_RANGE_COLOUR("step::sdf_contact_detect",
                                     0xff8e44ad);
-            sdf_contact_.detect(
+            contact.detect(
                 x_n_.gpu_data(),
                 n,
                 cuda_stream,
                 reinterpret_cast<const math::Vec3f*>(buffers_.vel.data()),
                 dt);
-            sdf_contact_.accumulate_gradient(
+            contact.accumulate_gradient(
                 rhs_.gpu_data(), n, cuda_stream);
         }
 
@@ -839,12 +853,14 @@ void ClothSimulator::step(float dt, std::uintptr_t cuda_stream) {
                 rhs_.gpu_data(), n, cuda_stream);
         }
 
-        // Coulomb-cone post-projection for the SDF body — same
+        // Coulomb-cone post-projection for each SDF body — same
         // additive role as the static-contact pass above.
-        if (sdf_contact_.active()) {
+        for (auto& contact_ptr : sdf_contacts_) {
+            auto& contact = *contact_ptr;
+            if (!contact.active()) continue;
             CHYSX_NVTX_RANGE_COLOUR("step::sdf_contact_friction",
                                     0xff9b59b6);
-            sdf_contact_.apply_coulomb_friction(
+            contact.apply_coulomb_friction(
                 rhs_.gpu_data(), n, cuda_stream);
         }
     }
@@ -934,12 +950,14 @@ void ClothSimulator::step(float dt, std::uintptr_t cuda_stream) {
             static_contacts_.bake_diag(H_.diag.gpu_data(), n, dt, cuda_stream);
         }
 
-        // SDF-volume contact diagonal — same role as the static
-        // contact bake, just sourced from the SDF detector cache.
-        if (sdf_contact_.active()) {
+        // SDF-volume contact diagonals — same role as the static
+        // contact bake, just sourced from each SDF detector's cache.
+        for (auto& contact_ptr : sdf_contacts_) {
+            auto& contact = *contact_ptr;
+            if (!contact.active()) continue;
             CHYSX_NVTX_RANGE_COLOUR("step::sdf_contact_diag",
                                     0xff8e44ad);
-            sdf_contact_.bake_diag(H_.diag.gpu_data(), n, dt, cuda_stream);
+            contact.bake_diag(H_.diag.gpu_data(), n, dt, cuda_stream);
         }
     }
 

@@ -50,15 +50,15 @@ inline int grid_for(int n) { return (n + kBlockDim - 1) / kBlockDim; }
 // rest frame.  depth ≤ 0 means "no active contact" and the downstream
 // scatter passes skip it.
 __global__ void detect_kernel(
-    const float3* __restrict__   positions,
-    const float3* __restrict__   velocities,   // may be nullptr
-    int                          n_particles,
-    SdfVolumeView                view,
-    float3                       body_velocity,
-    float                        thickness,
-    float                        dt,
-    math::Vec4f* __restrict__    contacts,
-    math::Vec4f* __restrict__    slips) {
+    const float3* __restrict__       positions,
+    const float3* __restrict__       velocities,        // may be nullptr
+    int                              n_particles,
+    SdfVolumeView                    view,
+    const math::Vec3f* __restrict__  body_velocity_dev, // 1 Vec3f on device
+    float                            thickness,
+    float                            dt,
+    math::Vec4f* __restrict__        contacts,
+    math::Vec4f* __restrict__        slips) {
     const int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= n_particles) return;
 
@@ -96,12 +96,13 @@ __global__ void detect_kernel(
         float       u_norm = 0.0f;
         if (depth > 0.0f && velocities != nullptr && dt > 0.0f) {
             const float3 vf = velocities[p];
+            const math::Vec3f vb = body_velocity_dev[0];
             // Relative velocity in the body frame: subtract body
             // linear velocity so a particle riding a translating body
             // sees zero slip.
-            const math::Vec3f v_rel(vf.x - body_velocity.x,
-                                    vf.y - body_velocity.y,
-                                    vf.z - body_velocity.z);
+            const math::Vec3f v_rel(vf.x - vb.x,
+                                    vf.y - vb.y,
+                                    vf.z - vb.z);
             const math::Vec3f dxv = v_rel * dt;
             const float vn = dot(n, dxv);
             u_t = dxv - n * vn;
@@ -144,9 +145,28 @@ __global__ void scatter_gradient_kernel(
         const float u_norm = slip.w;
         const float f1 = f1_sf_over_x(u_norm, friction_epsilon);
         const float alpha = friction_mu * f_n * f1;
-        rhs[p].x += -alpha * slip.x;
-        rhs[p].y += -alpha * slip.y;
-        rhs[p].z += -alpha * slip.z;
+        // IPC lagged-Newton friction.  `slip = (v_p - v_body) · dt`
+        // projected onto the tangent plane, i.e. the world-frame
+        // tangential displacement the cloth particle WOULD undergo
+        // this step *relative to the body* if no friction acted.
+        // The linearised friction reaction wants to cancel that
+        // relative motion, so it adds  +α · slip  to the *gradient*
+        // (the negative of the friction force).  `assemble_rhs`
+        // later flips the sign of the gradient when folding it into
+        // the Newton residual; the net effect on the final RHS is
+        //   rhs +=  -α · slip = +α · (v_body − v_p) · dt_t
+        // which pulls the particle toward the body in the tangent
+        // plane — exactly the direction needed to "stick" the cloth
+        // to a moving SDF jaw.
+        //
+        // The previous version had this with the opposite sign,
+        // which (for a stationary particle on an upward-moving jaw)
+        // dragged the cloth *downward* and made the gripper unable
+        // to lift its cargo.  See `example_chysx_sdf_gripper.py`
+        // for the regression that surfaced this.
+        rhs[p].x += alpha * slip.x;
+        rhs[p].y += alpha * slip.y;
+        rhs[p].z += alpha * slip.z;
     }
 }
 
@@ -242,15 +262,28 @@ __global__ void apply_coulomb_friction_kernel(
     const float F_T = sqrtf(F_T_sq);
 
     const float cone = friction_mu * f_n_mag;
-    if (F_T <= cone) {
-        rhs[p].x -= F0_t.x;
-        rhs[p].y -= F0_t.y;
-        rhs[p].z -= F0_t.z;
-    } else {
-        const float shrink = cone / F_T;
-        rhs[p].x -= shrink * F0_t.x;
-        rhs[p].y -= shrink * F0_t.y;
-        rhs[p].z -= shrink * F0_t.z;
+    if (F_T > cone) {
+        // SLIDING branch: cap the tangential force at the cone radius.
+        // The IPC implicit friction baked in `scatter_gradient` /
+        // `bake_diag` already drives sticking through an α·(I - nnᵀ)
+        // tangential stiffness; capping here brings it back inside the
+        // Coulomb cone when it overshoots.
+        //
+        // We deliberately do NOT zero the tangent in the STICK branch
+        // (|F_T| ≤ cone).  Doing so was safe for the static-body
+        // `StaticContactSet` (zero tangent == zero tangential
+        // acceleration == particle pinned in place), but for an SDF
+        // body with non-zero `body_velocity` the cloth is supposed to
+        // accelerate tangentially WITH the body — that's the whole
+        // point of friction in a moving-jaw scenario.  Zeroing rhs's
+        // tangent component would silently kill the IPC friction force
+        // that is doing the lifting, so the cloth never follows the
+        // jaw upward.  Letting the IPC term flow through unchanged
+        // when inside the cone gives the correct moving-body stick.
+        const float reduce = 1.0f - cone / F_T;
+        rhs[p].x -= reduce * F0_t.x;
+        rhs[p].y -= reduce * F0_t.y;
+        rhs[p].z -= reduce * F0_t.z;
     }
 }
 
@@ -281,7 +314,16 @@ void SdfContact::detect(const math::Vec3f* positions,
     cached_has_slip_ = need_slip;
 
     SdfVolumeView view = volume_->make_view();
-    const float3 vb = make_float3(body_velocity_.x, body_velocity_.y, body_velocity_.z);
+
+    // Lazy-allocate the 1-Vec3f device buffer for body velocity.
+    // Synchronously primed to the current host cache so the very
+    // first detect() after construction sees zero (the default)
+    // rather than uninitialised memory.
+    if (body_velocity_dev_.gpu_size() != 1u) {
+        body_velocity_dev_.resize(1u);
+        body_velocity_dev_[0] = body_velocity_;
+        body_velocity_dev_.copy_to_device(cuda_stream);
+    }
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
     detect_kernel<<<grid_for(n_particles), kBlockDim, 0, stream>>>(
@@ -289,12 +331,22 @@ void SdfContact::detect(const math::Vec3f* positions,
         reinterpret_cast<const float3*>(velocities),
         n_particles,
         view,
-        vb,
+        body_velocity_dev_.gpu_data(),
         thickness_,
         dt,
         contacts_.gpu_data(),
         need_slip ? slips_.gpu_data() : nullptr);
     check_cuda(cudaGetLastError(), "detect_kernel launch");
+}
+
+void SdfContact::set_body_velocity(const math::Vec3f& v,
+                                   std::uintptr_t cuda_stream) {
+    body_velocity_ = v;
+    if (body_velocity_dev_.gpu_size() != 1u) {
+        body_velocity_dev_.resize(1u);
+    }
+    body_velocity_dev_[0] = v;
+    body_velocity_dev_.copy_to_device(cuda_stream);
 }
 
 void SdfContact::accumulate_gradient(math::Vec3f*    rhs,

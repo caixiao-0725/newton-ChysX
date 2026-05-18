@@ -617,7 +617,23 @@ class SolverChysX(SolverBase):
                 stacklevel=2,
             )
 
-    # ---- SDF-volume contact (cloth ⇄ animated implicit body) ----------
+    # ---- SDF-volume contacts (cloth ⇄ animated implicit bodies) -------
+
+    def add_sdf_volume(self) -> int:
+        """Allocate a new SDF volume + contact pair and return its
+        index.  Call once per animated implicit body before any
+        ``bake_sdf_box`` / ``set_sdf_pose`` for that body.  Indices
+        are stable for the lifetime of the solver.
+
+        A simulator with zero SDF volumes (the default) skips the
+        whole SDF-contact pipeline at no cost — only call
+        :meth:`add_sdf_volume` when you actually need an SDF body.
+        """
+        return int(self._sim.add_sdf_volume())
+
+    def num_sdf_volumes(self) -> int:
+        """Number of SDF volumes currently held by the solver."""
+        return int(self._sim.num_sdf_volumes())
 
     def bake_sdf_box(
         self,
@@ -625,24 +641,32 @@ class SolverChysX(SolverBase):
         hy: float,
         hz: float,
         voxel_size: float,
+        volume_index: int | None = None,
         padding: float = -1.0,
+        corner_radius: float = 0.0,
         thickness: float = 0.0,
         stiffness: float = 1.0e4,
         friction: float = 0.0,
         friction_epsilon: float = 1.0e-4,
-    ) -> None:
-        """Bake an analytic axis-aligned box SDF into the simulator's
-        owned ``SdfVolume`` and configure the SDF-contact penalty
-        parameters in one call.
+    ) -> int:
+        """Bake an analytic axis-aligned box SDF into one of the
+        simulator's owned ``SdfVolume`` slots and configure the
+        SDF-contact penalty parameters in one call.
 
-        Call once at setup, after the solver has been constructed.
-        ``hx, hy, hz`` are the half-extents of the box along its local
-        ``+x, +y, +z`` axes; ``voxel_size`` controls the grid
-        resolution (pick small enough that ``voxel_size <<
+        Call once per implicit body at setup, after the solver has
+        been constructed.  ``hx, hy, hz`` are the half-extents along
+        the body's local ``+x, +y, +z`` axes; ``voxel_size`` controls
+        the grid resolution (pick small enough that ``voxel_size <<
         min(hx, hy, hz)`` for a clean trilinear gradient).  Per-frame
         body motion is driven afterwards via :meth:`set_sdf_pose` and
-        :meth:`set_sdf_body_velocity`.
+        :meth:`set_sdf_body_velocity`, addressed by the returned
+        ``volume_index``.
 
+        ``volume_index``
+            Existing slot index to bake into.  ``None`` (default)
+            allocates a fresh slot via :meth:`add_sdf_volume`.  Use
+            an explicit index to re-bake a body in place (e.g. when
+            its shape or resolution changes mid-simulation; rare).
         ``padding``
             Extra distance [m] the grid extends past the box surface
             on every axis.  ``< 0`` (default) means *auto*: ``max(
@@ -652,6 +676,11 @@ class SolverChysX(SolverBase):
             farther than ``thickness`` outside the body during transient
             phases (e.g. high-speed impact, free-fall before contact),
             in which case pick ``padding >= max distance to surface``.
+        ``corner_radius``
+            Optional edge-rounding radius [m] for the baked box SDF.
+            ``0`` keeps sharp edges; ``>0`` bakes a rounded box
+            (continuous normals near edges/corners), which helps avoid
+            force-direction jumps on adjacent cloth vertices.
 
         Penalty parameters mirror :class:`StaticContactSet`:
 
@@ -664,6 +693,12 @@ class SolverChysX(SolverBase):
             IPC-style Coulomb friction coefficient ``μ`` (dimensionless).
         ``friction_epsilon``
             Tangential slip regularisation distance ``ε_u`` [m].
+
+        Returns
+        -------
+        int
+            The ``volume_index`` of the baked body — pass to all
+            subsequent per-frame SDF API calls.
         """
 
         if thickness <= 0.0:
@@ -671,6 +706,9 @@ class SolverChysX(SolverBase):
                 "bake_sdf_box(thickness=...) must be positive; pick a value "
                 "comparable to the cloth's edge length."
             )
+
+        if volume_index is None:
+            volume_index = self.add_sdf_volume()
 
         # The grid must extend at least `thickness` past the body's
         # surface, otherwise particles in the active contact band sit
@@ -685,28 +723,55 @@ class SolverChysX(SolverBase):
             padding = max(2.0 * voxel_size,
                           thickness + 2.0 * voxel_size)
 
-        self._sim.bake_sdf_box(
-            hx=float(hx),
-            hy=float(hy),
-            hz=float(hz),
-            voxel_size=float(voxel_size),
-            padding=float(padding),
-        )
-        self._sim.set_sdf_contact_thickness(float(thickness))
-        self._sim.set_sdf_contact_stiffness(float(stiffness))
-        self._sim.set_sdf_contact_friction(float(friction))
-        self._sim.set_sdf_contact_friction_epsilon(float(friction_epsilon))
+        try:
+            self._sim.bake_sdf_box(
+                volume_index=int(volume_index),
+                hx=float(hx),
+                hy=float(hy),
+                hz=float(hz),
+                voxel_size=float(voxel_size),
+                padding=float(padding),
+                corner_radius=float(corner_radius),
+            )
+        except TypeError as exc:
+            # Backward compatibility for environments still loading an
+            # older `_chysx_native` binary that predates the
+            # `corner_radius` binding.
+            if "corner_radius" not in str(exc):
+                raise
+            self._sim.bake_sdf_box(
+                volume_index=int(volume_index),
+                hx=float(hx),
+                hy=float(hy),
+                hz=float(hz),
+                voxel_size=float(voxel_size),
+                padding=float(padding),
+            )
+        self._sim.set_sdf_contact_thickness(int(volume_index), float(thickness))
+        self._sim.set_sdf_contact_stiffness(int(volume_index), float(stiffness))
+        self._sim.set_sdf_contact_friction(int(volume_index), float(friction))
+        self._sim.set_sdf_contact_friction_epsilon(
+            int(volume_index), float(friction_epsilon))
+        return int(volume_index)
 
-    def set_sdf_pose(self, pos: tuple[float, float, float] | np.ndarray) -> None:
-        """Update the SDF body's world-space position (identity
-        rotation).  Cheap; call every frame for an animated body."""
+    def set_sdf_pose(
+        self,
+        volume_index: int,
+        pos: tuple[float, float, float] | np.ndarray,
+    ) -> None:
+        """Update SDF body ``volume_index``'s world-space position
+        (identity rotation).  Cheap; call every frame for an animated
+        body."""
         pos_np = np.ascontiguousarray(pos, dtype=np.float32).reshape(3)
-        self._sim.set_sdf_pose(pos_np)
+        self._sim.set_sdf_pose(int(volume_index), pos_np)
 
     def set_sdf_body_velocity(
-        self, v: tuple[float, float, float] | np.ndarray
+        self,
+        volume_index: int,
+        v: tuple[float, float, float] | np.ndarray,
     ) -> None:
-        """Set the SDF body's linear velocity in world frame [m/s].
+        """Set SDF body ``volume_index``'s linear velocity in world
+        frame [m/s].
 
         Subtracted from each cloth particle's velocity before
         projecting onto the contact tangent, so a particle riding the
@@ -714,7 +779,7 @@ class SolverChysX(SolverBase):
         update once per frame whenever the body is moving.
         """
         v_np = np.ascontiguousarray(v, dtype=np.float32).reshape(3)
-        self._sim.set_sdf_body_velocity(v_np)
+        self._sim.set_sdf_body_velocity(int(volume_index), v_np)
 
     # ---- pin animation ------------------------------------------------
 

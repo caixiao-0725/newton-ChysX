@@ -96,7 +96,14 @@ public:
     // contact tangent so friction sees the correct *relative* slip
     // (a particle riding a translating SDF body experiences zero
     // tangential slip when stationary in the body's frame).
-    void set_body_velocity(const math::Vec3f& v) noexcept { body_velocity_ = v; }
+    //
+    // Internally the latest value is async-copied into a 1-Vec3f
+    // device buffer the detect kernel reads through a pointer, so
+    // updates inside a CUDA Graph capture survive replay (a
+    // by-value kernel argument would have been snapshotted at
+    // capture time and silently frozen).
+    void set_body_velocity(const math::Vec3f& v,
+                           std::uintptr_t cuda_stream = 0);
     const math::Vec3f& body_velocity() const noexcept { return body_velocity_; }
 
     bool active() const noexcept {
@@ -168,6 +175,9 @@ private:
     // diag / cone-projection kernels are mirror images.
     CudaArray<math::Vec4f> contacts_;
     CudaArray<math::Vec4f> slips_;
+    // Device mirror of `body_velocity_`, one Vec3f.  See the comment
+    // above `set_body_velocity` for why this lives on device.
+    CudaArray<math::Vec3f> body_velocity_dev_;
 };
 
 }  // namespace collision

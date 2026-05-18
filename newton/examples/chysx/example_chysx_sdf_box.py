@@ -248,7 +248,7 @@ class Example:
         # vertical buzz that no amount of damping could kill.  With
         # the auto-padding the grid extends to z ≈ 0.178 and the
         # cloth settles cleanly (final |v| < 1 cm/s).
-        self.solver.bake_sdf_box(
+        self._box_volume_idx = self.solver.bake_sdf_box(
             hx=self._box_hx,
             hy=self._box_hy,
             hz=self._box_hz,
@@ -264,8 +264,8 @@ class Example:
             dtype=np.float32,
         )
         self._box_vel = np.zeros(3, dtype=np.float32)
-        self.solver.set_sdf_pose(self._box_pos)
-        self.solver.set_sdf_body_velocity(self._box_vel)
+        self.solver.set_sdf_pose(self._box_volume_idx, self._box_pos)
+        self.solver.set_sdf_body_velocity(self._box_volume_idx, self._box_vel)
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -327,8 +327,8 @@ class Example:
 
         # Physics side: push the new pose / velocity into the SDF
         # detector (host scalars; no device sync required).
-        self.solver.set_sdf_pose(self._box_pos)
-        self.solver.set_sdf_body_velocity(self._box_vel)
+        self.solver.set_sdf_pose(self._box_volume_idx, self._box_pos)
+        self.solver.set_sdf_body_velocity(self._box_volume_idx, self._box_vel)
 
         # Visualisation side: mirror the same pose onto the kinematic
         # Newton body.  body_q packs each transform as
@@ -395,7 +395,9 @@ class Example:
         # thickness slack: penalty contact only enforces the band
         # ``sdf > 0`` up to its thickness.
         box_top_z = float(self._box_pos[2] + self._box_hz)
-        slack = 1.5 * float(self.solver._sim.sdf_contact_thickness())
+        slack = 1.5 * float(
+            self.solver._sim.sdf_contact_thickness(self._box_volume_idx)
+        )
         z_min = float(q[:, 2].min())
         if z_min < box_top_z - slack - 0.05:
             # 0.05 m extra slack: the cloth's overhanging edges
