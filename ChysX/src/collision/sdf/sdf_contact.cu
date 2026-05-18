@@ -262,28 +262,40 @@ __global__ void apply_coulomb_friction_kernel(
     const float F_T = sqrtf(F_T_sq);
 
     const float cone = friction_mu * f_n_mag;
-    if (F_T > cone) {
-        // SLIDING branch: cap the tangential force at the cone radius.
-        // The IPC implicit friction baked in `scatter_gradient` /
-        // `bake_diag` already drives sticking through an α·(I - nnᵀ)
-        // tangential stiffness; capping here brings it back inside the
-        // Coulomb cone when it overshoots.
-        //
-        // We deliberately do NOT zero the tangent in the STICK branch
-        // (|F_T| ≤ cone).  Doing so was safe for the static-body
-        // `StaticContactSet` (zero tangent == zero tangential
-        // acceleration == particle pinned in place), but for an SDF
-        // body with non-zero `body_velocity` the cloth is supposed to
-        // accelerate tangentially WITH the body — that's the whole
-        // point of friction in a moving-jaw scenario.  Zeroing rhs's
-        // tangent component would silently kill the IPC friction force
-        // that is doing the lifting, so the cloth never follows the
-        // jaw upward.  Letting the IPC term flow through unchanged
-        // when inside the cone gives the correct moving-body stick.
-        const float reduce = 1.0f - cone / F_T;
-        rhs[p].x -= reduce * F0_t.x;
-        rhs[p].y -= reduce * F0_t.y;
-        rhs[p].z -= reduce * F0_t.z;
+    // if (F_T > cone) {
+    //     // SLIDING branch: cap the tangential force at the cone radius.
+    //     // The IPC implicit friction baked in `scatter_gradient` /
+    //     // `bake_diag` already drives sticking through an α·(I - nnᵀ)
+    //     // tangential stiffness; capping here brings it back inside the
+    //     // Coulomb cone when it overshoots.
+    //     //
+    //     // We deliberately do NOT zero the tangent in the STICK branch
+    //     // (|F_T| ≤ cone).  Doing so was safe for the static-body
+    //     // `StaticContactSet` (zero tangent == zero tangential
+    //     // acceleration == particle pinned in place), but for an SDF
+    //     // body with non-zero `body_velocity` the cloth is supposed to
+    //     // accelerate tangentially WITH the body — that's the whole
+    //     // point of friction in a moving-jaw scenario.  Zeroing rhs's
+    //     // tangent component would silently kill the IPC friction force
+    //     // that is doing the lifting, so the cloth never follows the
+    //     // jaw upward.  Letting the IPC term flow through unchanged
+    //     // when inside the cone gives the correct moving-body stick.
+    //     const float reduce = 1.0f - cone / F_T;
+    //     rhs[p].x -= reduce * F0_t.x;
+    //     rhs[p].y -= reduce * F0_t.y;
+    //     rhs[p].z -= reduce * F0_t.z;
+    // }
+    if (F_T <= cone) {
+        // Legacy STICK branch: remove all tangential force.
+        rhs[p].x -= F0_t.x;
+        rhs[p].y -= F0_t.y;
+        rhs[p].z -= F0_t.z;
+    } else {
+        // Legacy SLIDING branch: project onto cone boundary.
+        const float shrink = cone / F_T;
+        rhs[p].x -= shrink * F0_t.x;
+        rhs[p].y -= shrink * F0_t.y;
+        rhs[p].z -= shrink * F0_t.z;
     }
 }
 
