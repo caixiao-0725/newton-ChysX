@@ -77,13 +77,18 @@ class Example:
         self._box_hy = 0.30
         self._box_hz = 0.05
 
-        # SDF voxel size: ~5 mm.  With min half-extent 0.05 m we get
-        # ~10 voxels through the thin axis (plenty for clean trilinear
-        # gradients in the penalty band).  Total grid is bounded by
-        # ``bake_sdf_box``'s auto-padding (``thickness + 2·voxel``) ≈
-        # ~25 mm on every side, so the dense volume here is roughly
-        # 130 × 130 × 30 ≈ 500k floats = ~2 MB on device.
-        self._voxel_size = 5.0e-3
+        # SDF voxel size: ~2.5 mm.  Finer than strictly necessary to
+        # *represent* a box (we'd get away with 5 mm), but the cloth
+        # below is 65 × 65 — cell size 12.5 mm, particle radius 5 mm —
+        # and the trilinear gradient is only C⁰ across voxel
+        # boundaries (see sdf.md, trap 2).  A voxel comparable to the
+        # particle radius keeps the per-voxel normal jitter well under
+        # the FEM stretch / bending stiffness, so the cloth still
+        # settles to ~mm/s residuals.  Total grid is bounded by
+        # ``bake_sdf_box``'s auto-padding (``thickness + 2·voxel`` ≈
+        # 12 mm), so the dense volume sits at roughly
+        # 250 × 250 × 50 ≈ 3 M floats = ~12 MB on device.
+        self._voxel_size = 2.5e-3
 
         # Box motion schedule.
         #
@@ -93,7 +98,7 @@ class Example:
         # friction) without animation muddying the picture.  Set to
         # 0.2 to bring the lift back.
         self._box_z_initial = 0.05      # box bottom face on the floor
-        self._box_v_rise    = 0.0       # m/s  (was 0.2)
+        self._box_v_rise    = 0.1       # m/s  (was 0.2)
         self._t_rise_start  = 1.5       # s — start of rise phase
         self._t_rise_stop   = 4.5       # s — end of rise phase
         # (final z when the box stops moving)
@@ -109,10 +114,13 @@ class Example:
         # (we leave ``static_contact_enabled=False``).
         builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=-9.81)
 
-        # Cloth: 25 x 25 grid, 0.8 m square (slightly larger than the
+        # Cloth: 65 × 65 grid, 0.8 m square (slightly larger than the
         # box top so the edges drape over the rim).  Centred above the
-        # box's resting position.
-        self._cloth_dim = 25
+        # box's resting position.  At 65 × 65 the cell length is
+        # 12.5 mm — about 5× the SDF voxel — which is fine enough to
+        # show distinct cloth wrinkles on top of the box without
+        # blowing past the cap on ``self_collision_max_contacts``.
+        self._cloth_dim = 65
         self._cloth_size = 0.8
         cell = self._cloth_size / (self._cloth_dim - 1)
         self._edge_l = cell
@@ -212,7 +220,7 @@ class Example:
             fem_stretch_stiffness=5.0e2,
             fem_shear_stiffness=5.0e2,
             bending_stiffness=1.0e-4,           # matches cloth_drop
-            pcg_iterations=30,                  # matches cloth_drop
+            pcg_iterations=50,                  # matches cloth_drop
             surface_density=0.3,
             self_collision_enabled=True,
             self_collision_thickness=contact_thickness,
@@ -246,7 +254,7 @@ class Example:
             hz=self._box_hz,
             voxel_size=self._voxel_size,
             thickness=contact_thickness,
-            stiffness=1.0e4,
+            stiffness=1.0e3,
             friction=0.2,                       # was 0.4 — see note above
             friction_epsilon=1.0e-4,
         )
