@@ -1,0 +1,13 @@
+Warp 1.13.0 initialized:
+   CUDA Toolkit 12.9, Driver 13.1
+   Devices:
+     "cpu"      : "AMD64 Family 26 Model 68 Stepping 0, AuthenticAMD"
+     "cuda:0"   : "NVIDIA GeForce RTX 5090" (32 GiB, sm_120, mempool enabled)
+   Kernel cache:
+     \\?\C:\Users\toad\AppData\Local\NVIDIA\warp\Cache\1.13.0
+Module newton._src.viewer.kernels 6eaf52b load on device 'cuda:0' took 2.75 ms  (cached)
+[chysx_cloth_stack] 2 patches (101x101 each, 30 cm side) -> 20402 verts / 40000 tris;  self_thickness=1.2 mm,  static_thickness=1.5 mm,  self_friction(μ)=0.20,  static_friction(μ)=0.40,  initial vertical spacing=15.0 cm
+[chysx_cloth_stack] per-patch (z min/mean, x range, y range):
+  patch 0: z=[0.5693,0.5727]  x=[-0.242,+0.174]  y=[-0.179,+0.236]
+  patch 1: z=[0.7193,0.7227]  x=[-0.240,+0.178]  y=[-0.230,+0.188]
+[chysx_cloth_stack] |v| max=0.6445 m/s,  self_contacts=0

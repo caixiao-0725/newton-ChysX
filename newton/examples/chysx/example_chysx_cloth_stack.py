@@ -316,6 +316,19 @@ class Example:
         # remains stable.
         static_friction = 0.4               # dimensionless Coulomb μ
 
+        # IPC-style Coulomb friction between every VF/EE self-contact
+        # pair (cloth-on-cloth).  Without it the patches glide off each
+        # other under the smallest gravity tilt -- a stack of slippery
+        # silk -- and the upper layers eventually slip past the lower
+        # ones into the table.  With μ = 0.4 (same regime as the
+        # static-contact value, cotton-on-cotton) the upper patches
+        # settle into a stable corner-aligned column instead.  The
+        # friction Hessian `α · (I - n n^T)` is folded into the same
+        # self-collision SpMV sidecar, so enabling it costs at most
+        # one Vec4f load per contact per pass + one cheap slip-cache
+        # kernel per step.
+        self_friction = 0.2                 # dimensionless Coulomb μ
+
         # Untangle: same thickness band as proximity self-collision.
         # Use stiffness equal to self-collision here (not the usual 2×
         # EF/VF ratio from ``example_chysx_tshirt_drop``): two stacked
@@ -323,7 +336,7 @@ class Example:
         # stronger 2× ratio can excite false EF-cross impulses that
         # blow the pile sideways; ``k_untangle == k_self`` still clears
         # genuine inversions without fighting the proximity term.
-        untangle_k =  2.0 *1.0e2
+        untangle_k =  4.0 *1.0e2
 
         self.solver = newton.solvers.SolverChysX(
             self.model,
@@ -339,6 +352,7 @@ class Example:
             self_collision_enabled=True,
             self_collision_thickness=self_thickness,
             self_collision_stiffness=1.0e2,
+            self_collision_friction=self_friction,
             self_collision_max_contacts_factor=sc_narrow_factor,
             self_collision_max_ef_candidates_factor=sc_broad_factor,
             static_contact_enabled=True,
@@ -372,6 +386,7 @@ class Example:
             f"{self._n_verts_total} verts / {self._n_tris_total} tris;  "
             f"self_thickness={self_thickness*1e3:.1f} mm,  "
             f"static_thickness={static_thickness*1e3:.1f} mm,  "
+            f"self_friction(μ)={self_friction:.2f},  "
             f"static_friction(μ)={static_friction:.2f},  "
             f"initial vertical spacing={dz*1e2:.1f} cm"
         )

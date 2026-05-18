@@ -41,10 +41,10 @@
 
 #include <cstdint>
 
-#include "../math/matrix.cuh"
-#include "../math/vec.cuh"
-#include "../memory/cuda_array.h"  // also brings in DeviceSpan
-#include "../sparse/block_csr.h"
+#include "../../math/matrix.cuh"
+#include "../../math/vec.cuh"
+#include "../../memory/cuda_array.h"  // also brings in DeviceSpan
+#include "../../sparse/block_csr.h"
 
 namespace chysx {
 namespace constraint {

@@ -40,6 +40,7 @@
 - Add ViewerBase.should_step() — call once per frame to determine whether the simulation loop should advance; returns True when not paused.
 - Add Kamino-specific simulation examples in `newton/examples/kamino`
 - Add ChysX example `chysx_cloth_pin_rain` (pinned four-corner sheet + `--num-small` cloth squares dropped from above).
+- Add IPC-style smooth Coulomb friction at cloth self-contact (VF + EE pairs) in `SolverChysX` via the new `self_collision_friction` (dimensionless `μ`, default `0`) and `self_collision_friction_epsilon` (slip regularisation distance `ε_u` [m], default `1e-4`) parameters. The friction Hessian (`α · (I - n n^T)` blocks) and gradient (`-α · w_i · u_t^lag` per particle) are folded into the existing self-collision SpMV sidecar and gradient scatter (`bake_contact_diag` / `apply_contact_spmv` / `SelfCollisionConstraint::accumulate_gradient`), reusing the same `pairs / weights / normal / w_i` loads -- enabling friction adds at most one Vec4f load per contact per pass and one small slip-cache kernel per step, with no new sparsity pattern. `α = μ · k · depth · f1_SF_over_x(‖u_t,lag‖)` saturates at the Coulomb limit `μ · f_n` past `ε_u`.
 - Add per-mesh `color` override to `ViewerBase.log_mesh()` for tinting individual meshes without authoring per-vertex colors
 - Add per-mesh `roughness` and `metallic` PBR overrides to `ViewerBase.log_mesh()`
 

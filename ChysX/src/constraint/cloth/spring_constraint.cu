@@ -11,7 +11,7 @@
 #include <string>
 #include <vector>
 
-#include "../sparse/block_csr_atomic.cuh"
+#include "../../sparse/block_csr_atomic.cuh"
 
 namespace chysx {
 namespace constraint {

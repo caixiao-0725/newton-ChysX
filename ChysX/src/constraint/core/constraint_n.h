@@ -25,9 +25,9 @@
 
 #include <vector>
 
-#include "../math/vec.cuh"
-#include "../memory/cuda_array.h"
-#include "../sparse/block_csr.h"
+#include "../../math/vec.cuh"
+#include "../../memory/cuda_array.h"
+#include "../../sparse/block_csr.h"
 #include "constraint.h"
 
 namespace chysx {

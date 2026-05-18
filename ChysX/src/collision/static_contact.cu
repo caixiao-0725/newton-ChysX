@@ -20,6 +20,8 @@
 #include <string>
 #include <utility>
 
+#include "friction.cuh"
+
 namespace chysx {
 namespace collision {
 
@@ -164,20 +166,11 @@ __global__ void detect_kernel(
     }
 }
 
-// IPC-style smoothing of `1 / ‖u_t‖`.  Linear ramp inside the
-// regularisation band so that `‖f_t‖ → 0` as `‖u_t‖ → 0` (no spurious
-// tangential force at standstill); plain `1/‖u_t‖` outside the band
-// so the resulting force saturates at `μ · f_n` for any meaningful
-// slip.  Matches `compute_projected_isotropic_friction` in the VBD
-// kernels (newton/_src/solvers/vbd/rigid_vbd_kernels.py).
+// IPC `f1_SF_over_x` lives in friction.cuh so the self-collision
+// pipeline can share the exact same formula.  Local alias keeps the
+// existing call sites short.
 __device__ inline float f1_sf_over_x(float u_norm, float eps_u) {
-    if (u_norm > eps_u) {
-        return 1.0f / u_norm;
-    }
-    // Linear ramp on [0, eps_u]: at u_norm = 0 the value is 2/eps_u
-    // (largest), at u_norm = eps_u it matches the outer branch
-    // (1/eps_u) so the function is C0-continuous.
-    return (-u_norm / eps_u + 2.0f) / eps_u;
+    return ipc_f1_sf_over_x(u_norm, eps_u);
 }
 
 // rhs[p] += -k * depth * n  +  (-α * u_t^lag).

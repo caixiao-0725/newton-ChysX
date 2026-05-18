@@ -49,9 +49,9 @@ class Example:
         # 60 fps render with 4 substeps -> 240 Hz physics, the smallest
         # rate where stiff (k=1e4) ground / table contacts stay
         # well-conditioned for the default PCG iteration count.
-        self.fps = 60
+        self.fps = 100
         self.frame_dt = 1.0 / self.fps
-        self.sim_substeps = 4
+        self.sim_substeps = 1
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.sim_time = 0.0
 

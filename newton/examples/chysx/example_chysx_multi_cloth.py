@@ -225,6 +225,16 @@ class Example:
         utg_thickness = 0.005
         utg_stiffness = 1.0e2
 
+        # IPC Coulomb friction at every VF/EE self-contact pair.  cuda-cloth's
+        # MultiClothCase ran frictionless (penalty-only); ChysX layers the
+        # IPC-style tangent block onto the same SpMV sidecar, so enabling it
+        # only costs one extra slip-cache kernel + one Vec4f load per contact
+        # per pass.  mu = 0.4 sits between slick synthetic (~0.2) and cotton
+        # (~0.6); ε_u = 1e-4 m is well below the ~0.02 m edge length so the
+        # smoothing band is sub-cell.
+        sc_friction       = 0.5
+        sc_friction_eps_u = 1.0e-4
+
         # 5 layers x 50x50 + extras puts the worst-case proximity contact
         # density well above the chysx default of 8x particle_count;
         # mirror the untangle example's generous sizing.
@@ -251,6 +261,8 @@ class Example:
             self_collision_enabled=True,
             self_collision_thickness=sc_thickness,
             self_collision_stiffness=sc_stiffness,
+            self_collision_friction=sc_friction,
+            self_collision_friction_epsilon=sc_friction_eps_u,
             self_collision_max_contacts_factor=self_collision_max_contacts_factor,
             self_collision_max_ef_candidates_factor=self_collision_max_ef_candidates_factor,
             untangle_enabled=bool(args.untangle),
@@ -294,7 +306,8 @@ class Example:
         print(
             f"[chysx_multi_cloth] 5-layer.obj: {self._n_verts} verts / "
             f"{self._n_tris} tris;  pins={list(self._pin_indices)};  "
-            f"sc(k={sc_stiffness:g}, h={sc_thickness:g}),  "
+            f"sc(k={sc_stiffness:g}, h={sc_thickness:g}, "
+            f"mu={sc_friction:g}, eps_u={sc_friction_eps_u:g}),  "
             f"untangle({'on' if self._untangle_enabled else 'off'}: "
             f"k={utg_stiffness:g}, h={utg_thickness:g})"
         )

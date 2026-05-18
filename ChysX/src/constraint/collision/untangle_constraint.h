@@ -47,10 +47,10 @@
 
 #include <cstdint>
 
-#include "../collision/untangle.h"
-#include "../math/matrix.cuh"
-#include "../math/vec.cuh"
-#include "../memory/device_span.h"
+#include "../../collision/untangle.h"
+#include "../../math/matrix.cuh"
+#include "../../math/vec.cuh"
+#include "../../memory/device_span.h"
 
 namespace chysx {
 namespace constraint {

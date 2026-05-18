@@ -219,18 +219,25 @@ class Example:
         #   -> 1.0 rad/s in the time domain.
         self.rot_angular_velocity = 1.0
         # cuda-cloth's loop bound: 1000 steps -> 10 s of sim time.
-        self.rot_end_time = 20.0
+        self.rot_end_time = 25.0
 
         # ---- self-collision parameters ----------------------------------
         #
         # cuda-cloth's TwistCase:
-        #   m_cloth.m_buffer.m_thickness        = edge_l * 0.2
-        #   m_selfCollision.m_params.m_4_thickness = edge_l * 0.2 * 1.2
-        #   m_selfCollision.m_params.m_4_k         = 1000
-        # (m_5_k / m_5_thickness exist but `ResolveNarrowPhase` is
-        # commented out in TwistCase::Run so they never fire.)
-        thickness = 0.2 * 1.2 * edge_l
-        self._self_collision_thickness = thickness
+        #   m_cloth.m_buffer.m_thickness            = edge_l * 0.2
+        #   m_selfCollision.m_params.m_4_thickness  = edge_l * 0.2 * 1.2
+        #   m_selfCollision.m_params.m_4_k          = 1000
+        # cuda-cloth's reference TwistCase comments `ResolveNarrowPhase`
+        # out, so its untangle (5-vertex EF) pass never fires.  We
+        # enable it here because wringing a towel up to ~20 rad of
+        # twist is the canonical case where proximity-only contact
+        # silently allows opposite-side edges to slip past each other
+        # (the layers cross before the proximity band can react).  The
+        # untangle pass restores already-crossed edges, complementary
+        # to proximity which only fires for not-yet-crossed pairs.
+        sc_thickness  = 0.2 * 1.2 * edge_l    # m_4_thickness (proximity band)
+        utg_thickness = 0.2 * edge_l          # m_thickness (actual cloth thickness)
+        self._self_collision_thickness = sc_thickness
 
         # ---- solver -----------------------------------------------------
 
@@ -248,7 +255,7 @@ class Example:
         # gives 1.28M cap which is ample headroom.  Bump up further
         # only if `solver._sim.self_collision_count()` actually
         # saturates this cap.
-        self_collision_max_contacts_factor = 64
+        self_collision_max_contacts_factor = 128
         # Broad-phase EF candidate buffer (LBVH `(edge_id, face_id)`
         # output before any geometric test).  Wrung-up dense cloth
         # produces O(10x) more candidates than surviving contacts, so
@@ -257,7 +264,7 @@ class Example:
         # even though narrow-phase has plenty of room" symptom because
         # narrow-phase only ever runs on whatever pairs broad-phase
         # managed to write.
-        self_collision_max_ef_candidates_factor = 256
+        self_collision_max_ef_candidates_factor = 512
 
         self.solver = newton.solvers.SolverChysX(
             self.model,
@@ -270,16 +277,28 @@ class Example:
             damping=0.0,
             fem_stretch_stiffness=5.0e2,   # m_k = 500
             fem_shear_stiffness=5.0e2,     # m_k = 500 (cuda-cloth shares one constant)
-            bending_stiffness=5.0e-4,      # m_bending_k = 5e-4
+            bending_stiffness=5.0e-5,      # m_bending_k = 5e-4
             pin_indices=self._pin_indices.tolist(),
             pin_stiffness=1.0e9,           # m_control_mag = 1e9
             pcg_iterations=50,            # PCGSolver m_maxIter = 100
             surface_density=surface_density,
             self_collision_enabled=True,
-            self_collision_thickness=thickness,
+            self_collision_thickness=sc_thickness,
             self_collision_stiffness=1.0e3,  # m_4_k = 1000
             self_collision_max_contacts_factor=self_collision_max_contacts_factor,
             self_collision_max_ef_candidates_factor=self_collision_max_ef_candidates_factor,
+            # Untangle (5-vertex EF) shares the proximity BVH and
+            # reuses the narrow-phase contact buffer cap above.  The
+            # thinner band (`m_thickness`, no 1.2x inflation) means
+            # untangle only restores genuinely crossed edges; the 2x
+            # stiffness (`m_5_k = 2000` style) matches the
+            # tshirt_drop / multi_cloth convention and is what gets
+            # the fully-wrung pose to settle without a residual
+            # 1-cell-thick interpenetration sliver.
+            untangle_enabled=True,
+            untangle_thickness=utg_thickness,
+            untangle_stiffness=2.0e3,
+            untangle_max_contacts_factor=self_collision_max_contacts_factor,
         )
 
         self.state_0 = self.model.state()

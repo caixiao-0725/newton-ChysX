@@ -41,9 +41,9 @@
 #include "../math/vec.cuh"
 #include "../memory/cuda_array.h"
 #include "../memory/device_span.h"
-#include "aabb.cuh"
+#include "bvh/aabb.cuh"
+#include "bvh/quant_bvh.h"
 #include "mesh_topology.h"
-#include "quant_bvh.h"
 
 namespace chysx {
 namespace collision {
@@ -93,6 +93,28 @@ public:
                 float thickness,
                 std::uintptr_t cuda_stream = 0);
 
+    // IPC-style Lagged-Newton friction support.  After `detect()`,
+    // walks the just-emitted contact list and computes the per-pair
+    // tangential slip
+    //
+    //     u_rel       = Σ_i w_i · v_i           (relative velocity
+    //                                            at the contact point,
+    //                                            barycentric-weighted)
+    //     u_t^lag     = (u_rel - (u_rel · n) · n) · dt
+    //
+    // packed into `slips_[c] = (u_t.x, u_t.y, u_t.z, ‖u_t‖)`.  This
+    // is the slip cache the friction Hessian / RHS terms read inside
+    // `bake_contact_diag`, `apply_contact_spmv` and
+    // `SelfCollisionConstraint::accumulate_gradient` -- the friction
+    // contribution is merged into those existing kernels (no extra
+    // launches, no extra reads of `pairs / weights`).
+    //
+    // Idempotent: a no-op when `velocities == nullptr`, `dt <= 0`, or
+    // the detector has not been run yet.
+    void accumulate_slips(const math::Vec3f* velocities,
+                          float              dt,
+                          std::uintptr_t     cuda_stream = 0);
+
     // ---- result accessors --------------------------------------------
 
     int max_contacts() const noexcept { return max_contacts_; }
@@ -106,6 +128,13 @@ public:
 
     CudaArray<ContactWeights>& weights() noexcept { return weights_; }
     const CudaArray<ContactWeights>& weights() const noexcept { return weights_; }
+
+    // Per-pair lagged tangential slip cache, valid after the most
+    // recent `accumulate_slips(...)` call.  `slips()[c].w` holds
+    // ‖u_t^lag‖ for the friction smoothing function.  Empty (gpu_size
+    // == 0) until `accumulate_slips` has run at least once.
+    CudaArray<math::Vec4f>& slips() noexcept { return slips_; }
+    const CudaArray<math::Vec4f>& slips() const noexcept { return slips_; }
 
     // Device pointer to the int32 contact counter; the constraint
     // kernel reads this to bound its loop.
@@ -158,6 +187,13 @@ private:
     CudaArray<math::Vec4i>     pairs_;
     CudaArray<ContactWeights>  weights_;
     CudaArray<int>             count_;  // single-element counter
+
+    // Per-pair lagged tangential slip cache for IPC friction.  Allocated
+    // lazily on first `accumulate_slips()`; sized to `max_contacts_` to
+    // match the `pairs_` / `weights_` layout, so the friction terms
+    // baked into the existing scatter / SpMV kernels can index it with
+    // the same `c` they use for `pairs_[c]` / `weights_[c]`.
+    CudaArray<math::Vec4f>     slips_;
 };
 
 }  // namespace collision

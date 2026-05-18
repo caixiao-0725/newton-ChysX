@@ -151,6 +151,20 @@ class SolverChysX(SolverBase):
             sidecar (a ``ContactSpMVOp``) the PCG solver consumes
             directly, so even very large ``k`` does not pollute the
             CSR topology between frames.
+        self_collision_friction: IPC-style Coulomb friction
+            coefficient ``μ`` (dimensionless) applied at every VF / EE
+            self-contact pair.  ``μ = 0`` (default) disables friction.
+            Folded into the same kernels that already touch
+            ``pairs / weights / normals`` (no extra launches, no new
+            sparsity).  Typical fabric values land between 0.2 (slick
+            synthetic) and 0.6 (cotton).
+        self_collision_friction_epsilon: Tangential slip
+            regularisation distance ``ε_u`` [m] for the IPC smoothing
+            function ``f1_SF_over_x``.  Below ``ε_u`` the friction
+            force ramps linearly with slip (no spurious force at
+            standstill); past it the force saturates at the Coulomb
+            bound ``μ · f_n``.  Default ``1e-4`` m is reasonable for
+            cloth at millimetre cell sizes.
         self_collision_max_contacts_factor: Multiplier on
             ``particle_count`` used to size the device-side
             *narrow-phase* contact result buffer (the
@@ -281,6 +295,8 @@ class SolverChysX(SolverBase):
         self_collision_enabled: bool = False,
         self_collision_thickness: float = 0.0,
         self_collision_stiffness: float = 1.0e3,
+        self_collision_friction: float = 0.0,
+        self_collision_friction_epsilon: float = 1.0e-4,
         self_collision_max_contacts_factor: int = 8,
         self_collision_max_ef_candidates_factor: int = 32,
         static_contact_enabled: bool = False,
@@ -439,6 +455,10 @@ class SolverChysX(SolverBase):
             self._sim.set_self_collision_enabled(True)
             self._sim.set_self_collision_thickness(float(self_collision_thickness))
             self._sim.set_self_collision_stiffness(float(self_collision_stiffness))
+            self._sim.set_self_collision_friction(float(self_collision_friction))
+            self._sim.set_self_collision_friction_epsilon(
+                float(self_collision_friction_epsilon)
+            )
             # Narrow-phase cap: actual VF/EE contacts kept after geometric
             # filtering.  Lower bound 1024 so tiny meshes still get a
             # workable buffer.
@@ -596,6 +616,105 @@ class SolverChysX(SolverBase):
                 "...) to register obstacles.",
                 stacklevel=2,
             )
+
+    # ---- SDF-volume contact (cloth ⇄ animated implicit body) ----------
+
+    def bake_sdf_box(
+        self,
+        hx: float,
+        hy: float,
+        hz: float,
+        voxel_size: float,
+        padding: float = -1.0,
+        thickness: float = 0.0,
+        stiffness: float = 1.0e4,
+        friction: float = 0.0,
+        friction_epsilon: float = 1.0e-4,
+    ) -> None:
+        """Bake an analytic axis-aligned box SDF into the simulator's
+        owned ``SdfVolume`` and configure the SDF-contact penalty
+        parameters in one call.
+
+        Call once at setup, after the solver has been constructed.
+        ``hx, hy, hz`` are the half-extents of the box along its local
+        ``+x, +y, +z`` axes; ``voxel_size`` controls the grid
+        resolution (pick small enough that ``voxel_size <<
+        min(hx, hy, hz)`` for a clean trilinear gradient).  Per-frame
+        body motion is driven afterwards via :meth:`set_sdf_pose` and
+        :meth:`set_sdf_body_velocity`.
+
+        ``padding``
+            Extra distance [m] the grid extends past the box surface
+            on every axis.  ``< 0`` (default) means *auto*: ``max(
+            2·voxel_size, thickness + 2·voxel_size)`` so the entire
+            contact band is well inside the grid and the trilinear
+            stencil stays clean.  Override only if the cloth can wander
+            farther than ``thickness`` outside the body during transient
+            phases (e.g. high-speed impact, free-fall before contact),
+            in which case pick ``padding >= max distance to surface``.
+
+        Penalty parameters mirror :class:`StaticContactSet`:
+
+        ``thickness``
+            Contact distance threshold ``h`` [m].  A particle with
+            ``sdf(x) < h`` becomes a contact with depth ``h - sdf(x)``.
+        ``stiffness``
+            Per-contact penalty stiffness ``k`` [N/m].
+        ``friction``
+            IPC-style Coulomb friction coefficient ``μ`` (dimensionless).
+        ``friction_epsilon``
+            Tangential slip regularisation distance ``ε_u`` [m].
+        """
+
+        if thickness <= 0.0:
+            raise ValueError(
+                "bake_sdf_box(thickness=...) must be positive; pick a value "
+                "comparable to the cloth's edge length."
+            )
+
+        # The grid must extend at least `thickness` past the body's
+        # surface, otherwise particles in the active contact band sit
+        # *outside* the grid for part of the time, the sampler returns
+        # the out-of-grid sentinel `sd = 1e30` (== "no contact"), and
+        # the penalty force switches on and off as the particle wiggles
+        # across the grid edge.  That manifests as a high-frequency
+        # vertical buzz on top of a body that should look static.  We
+        # add two voxels of head-room past `thickness` for the
+        # trilinear gradient stencil to stay clean.
+        if padding < 0.0:
+            padding = max(2.0 * voxel_size,
+                          thickness + 2.0 * voxel_size)
+
+        self._sim.bake_sdf_box(
+            hx=float(hx),
+            hy=float(hy),
+            hz=float(hz),
+            voxel_size=float(voxel_size),
+            padding=float(padding),
+        )
+        self._sim.set_sdf_contact_thickness(float(thickness))
+        self._sim.set_sdf_contact_stiffness(float(stiffness))
+        self._sim.set_sdf_contact_friction(float(friction))
+        self._sim.set_sdf_contact_friction_epsilon(float(friction_epsilon))
+
+    def set_sdf_pose(self, pos: tuple[float, float, float] | np.ndarray) -> None:
+        """Update the SDF body's world-space position (identity
+        rotation).  Cheap; call every frame for an animated body."""
+        pos_np = np.ascontiguousarray(pos, dtype=np.float32).reshape(3)
+        self._sim.set_sdf_pose(pos_np)
+
+    def set_sdf_body_velocity(
+        self, v: tuple[float, float, float] | np.ndarray
+    ) -> None:
+        """Set the SDF body's linear velocity in world frame [m/s].
+
+        Subtracted from each cloth particle's velocity before
+        projecting onto the contact tangent, so a particle riding the
+        body sees zero spurious friction.  Default ``(0, 0, 0)``;
+        update once per frame whenever the body is moving.
+        """
+        v_np = np.ascontiguousarray(v, dtype=np.float32).reshape(3)
+        self._sim.set_sdf_body_velocity(v_np)
 
     # ---- pin animation ------------------------------------------------
 

@@ -24,15 +24,17 @@
 #include <cstdint>
 
 #include "../collision/mesh_topology.h"
+#include "../collision/sdf/sdf_contact.h"
+#include "../collision/sdf/sdf_volume.h"
 #include "../collision/self_collision.h"
 #include "../collision/static_contact.h"
 #include "../collision/untangle.h"
-#include "../constraint/bending_constraint.h"
-#include "../constraint/pin_constraint.h"
-#include "../constraint/self_collision_constraint.h"
-#include "../constraint/spring_constraint.h"
-#include "../constraint/triangle_stretch_constraint.h"
-#include "../constraint/untangle_constraint.h"
+#include "../constraint/cloth/bending_constraint.h"
+#include "../constraint/cloth/pin_constraint.h"
+#include "../constraint/cloth/spring_constraint.h"
+#include "../constraint/cloth/triangle_stretch_constraint.h"
+#include "../constraint/collision/self_collision_constraint.h"
+#include "../constraint/collision/untangle_constraint.h"
 #include "../math/matrix.cuh"
 #include "../math/vec.cuh"
 #include "../memory/cuda_array.h"
@@ -46,7 +48,15 @@ namespace cloth {
 
 class ClothSimulator {
 public:
-    ClothSimulator() = default;
+    // Bind the owned `SdfContact` to the owned `SdfVolume` at
+    // construction so the per-step pipeline can call
+    // `sdf_contact_.active()` without any further setup.  Volume
+    // stays empty (active() == false) until the caller invokes
+    // `sdf_volume().bake_box(...)` or `bake_from_host(...)`; in that
+    // dormant state the SDF pipeline is a per-step no-op.
+    ClothSimulator() {
+        sdf_contact_.bind_volume(&sdf_volume_);
+    }
 
     // Move-only.  Two simulators with the same external pointers would
     // step the same particles twice, which is almost never desired.
@@ -226,6 +236,31 @@ public:
         return self_collision_.stiffness();
     }
 
+    // IPC-style Coulomb friction between cloth particles at every
+    // VF / EE self-contact pair.  `μ` is dimensionless; zero (default)
+    // disables friction entirely and skips the slip-cache pass.  The
+    // friction Hessian + RHS contributions are folded into the same
+    // self-collision kernels (`bake_contact_diag`,
+    // `apply_contact_spmv`, `SelfCollisionConstraint::accumulate_gradient`),
+    // so enabling friction adds at most one Vec4f load per contact per
+    // pass + one tiny `scatter_slips_kernel` launch per step.
+    void set_self_collision_friction(float mu) noexcept {
+        self_collision_.set_friction(mu);
+    }
+    float self_collision_friction() const noexcept {
+        return self_collision_.friction();
+    }
+
+    // Tangential slip regularisation distance `ε_u` [m] for the IPC
+    // smoothing function.  Default `1e-4 m` is reasonable for cloth at
+    // millimetre-scale cell sizes.
+    void set_self_collision_friction_epsilon(float eps_u) noexcept {
+        self_collision_.set_friction_epsilon(eps_u);
+    }
+    float self_collision_friction_epsilon() const noexcept {
+        return self_collision_.friction_epsilon();
+    }
+
     // Allocate the detector's contact result buffers and the broadphase
     // EF-candidate list.  Idempotent; re-call only if you want to grow
     // the caps.  The default `max_ef_candidates = max_contacts` works
@@ -387,6 +422,37 @@ public:
         return static_contacts_;
     }
 
+    // ---- SDF-volume contact (cloth ⇄ animated implicit body) --------
+    //
+    // Penalty contact between cloth particles and an *animated*
+    // signed-distance-field body (`SdfVolume`).  Same per-particle
+    // detect / scatter / diag / cone-projection pipeline as
+    // `StaticContactSet`, but the body geometry is a baked voxel
+    // grid (arbitrary shapes via `bake_box(...)` or
+    // `bake_from_host(...)`) and the body has a per-step rigid pose +
+    // linear velocity that flows into both the contact normals and
+    // the friction slip cache.
+    //
+    // The simulator owns the volume and the contact set; the volume
+    // is bound to the contact at construction (no further setup
+    // needed).  Typical use:
+    //
+    //     sim.sdf_volume().bake_box(0.3f, 0.3f, 0.05f, 0.01f);
+    //     sim.sdf_contact().set_thickness(0.003f);
+    //     sim.sdf_contact().set_stiffness(1.0e4f);
+    //     sim.sdf_contact().set_friction(0.4f);
+    //     // ...each step:
+    //     sim.sdf_volume().set_pose_translation({0, 0, z_box});
+    //     sim.sdf_contact().set_body_velocity({0, 0, v_box});
+    //
+    // The pipeline is a no-op when no volume data has been baked
+    // (`sdf_volume().active() == false`) or when stiffness == 0.
+    collision::SdfVolume& sdf_volume() noexcept { return sdf_volume_; }
+    const collision::SdfVolume& sdf_volume() const noexcept { return sdf_volume_; }
+
+    collision::SdfContact& sdf_contact() noexcept { return sdf_contact_; }
+    const collision::SdfContact& sdf_contact() const noexcept { return sdf_contact_; }
+
     // ---- pin target update (no re-bind) -------------------------------
     //
     // Cheap per-frame update of the pinned particles' target world
@@ -514,6 +580,8 @@ private:
     bool                                  untangle_enabled_ = false;
     float                                 untangle_thickness_ = 0.0f;
     collision::StaticContactSet           static_contacts_;
+    collision::SdfVolume                  sdf_volume_;
+    collision::SdfContact                 sdf_contact_;
 
     // ---- implicit-Euler PCG step working state ----------------------
     //
