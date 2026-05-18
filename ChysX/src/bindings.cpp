@@ -341,6 +341,32 @@ stiffer contact response at the cost of PCG conditioning.
         .def("self_collision_stiffness",
              &chysx::cloth::ClothSimulator::self_collision_stiffness,
              "Currently configured contact penalty stiffness.")
+        .def("set_self_collision_friction",
+             &chysx::cloth::ClothSimulator::set_self_collision_friction,
+             py::arg("friction"),
+             R"pbdoc(
+Set the IPC-style Coulomb friction coefficient ``μ`` (dimensionless)
+applied at every VF / EE self-contact pair.  Folded into the same
+kernels that already process self-contact (no extra launches, no new
+sparsity).  ``μ = 0`` (default) disables friction; typical fabric
+values land between 0.2 (slippery synthetic) and 0.6 (cotton).
+)pbdoc")
+        .def("self_collision_friction",
+             &chysx::cloth::ClothSimulator::self_collision_friction,
+             "Currently configured self-collision friction coefficient.")
+        .def("set_self_collision_friction_epsilon",
+             &chysx::cloth::ClothSimulator::set_self_collision_friction_epsilon,
+             py::arg("epsilon"),
+             R"pbdoc(
+Set the tangential slip regularisation distance ``ε_u`` [m] used by
+the IPC ``f1_SF_over_x`` smoothing function.  Tangential displacements
+smaller than ``ε_u`` ramp friction force linearly with slip; past that
+the force saturates at the Coulomb limit ``μ · f_n``.  ``1e-4 m`` is a
+reasonable default for cloth at millimetre cell sizes.
+)pbdoc")
+        .def("self_collision_friction_epsilon",
+             &chysx::cloth::ClothSimulator::self_collision_friction_epsilon,
+             "Currently configured self-collision friction epsilon.")
         .def("set_self_collision_max_contacts",
              &chysx::cloth::ClothSimulator::set_self_collision_max_contacts,
              py::arg("max_contacts"),
@@ -554,18 +580,191 @@ uses identity (``ex=(1,0,0)``, ``ey=(0,1,0)``, ``ez=(0,0,1)``).
              "Currently configured static-shape contact stiffness.")
         .def("set_static_contact_friction",
              &chysx::cloth::ClothSimulator::set_static_contact_friction,
-             py::arg("mu_v"),
-             "Viscous tangential friction coefficient ``μ_v`` [N·s/m].  "
-             "Zero disables friction.")
+             py::arg("mu"),
+             "Coulomb friction coefficient ``μ`` (dimensionless).  Adds a "
+             "Lagged-Newton IPC isotropic Coulomb friction block to A's "
+             "diagonal that self-caps at ``μ · f_n``.  Zero disables friction.")
         .def("static_contact_friction",
              &chysx::cloth::ClothSimulator::static_contact_friction,
-             "Currently configured static-shape viscous friction coefficient.")
+             "Currently configured static-shape Coulomb friction coefficient.")
+        .def("set_static_contact_friction_epsilon",
+             &chysx::cloth::ClothSimulator::set_static_contact_friction_epsilon,
+             py::arg("eps_u"),
+             "Tangential slip regularisation distance ``ε_u`` [m] for the "
+             "Coulomb friction model (default 1e-4).  Smaller values stick "
+             "harder; larger values produce a softer ramp-up to the cone.")
+        .def("static_contact_friction_epsilon",
+             &chysx::cloth::ClothSimulator::static_contact_friction_epsilon,
+             "Currently configured static-shape friction regularisation ``ε_u``.")
         .def("static_plane_count",
              &chysx::cloth::ClothSimulator::static_plane_count,
              "Number of registered static planes.")
         .def("static_box_count",
              &chysx::cloth::ClothSimulator::static_box_count,
              "Number of registered static boxes.")
+        // ---- SDF-volume contact (cloth ⇄ animated implicit body) ----
+        .def(
+            "bake_sdf_box",
+            [](chysx::cloth::ClothSimulator& s,
+               float hx, float hy, float hz,
+               float voxel_size, float padding) {
+                s.sdf_volume().bake_box(hx, hy, hz, voxel_size, padding);
+            },
+            py::arg("hx"),
+            py::arg("hy"),
+            py::arg("hz"),
+            py::arg("voxel_size"),
+            py::arg("padding") = -1.0f,
+            R"pbdoc(
+Bake an analytic axis-aligned box SDF into the owned `SdfVolume`.
+
+The box is centred at the volume's local origin with half-extents
+``(hx, hy, hz)``.  The grid is padded by ``padding`` on every axis so
+the SDF stays monotonic past the surface (defaults to
+``2 · voxel_size`` when ``padding < 0``).  Call once at setup; per-
+frame motion is configured separately via ``set_sdf_pose(...)``.
+
+Parameters
+----------
+hx, hy, hz : float
+    Half-extents of the box along its local x/y/z axes [m].
+voxel_size : float
+    Edge length of the cubic voxels used to sample the SDF [m].
+    Pick small enough that ``voxel_size << min(hx, hy, hz)`` so the
+    trilinear gradient near the surface is well-resolved (a couple
+    of voxels per particle-thickness band is usually plenty).
+padding : float, optional
+    Extra padding on every axis [m]; default is ``2 · voxel_size``.
+)pbdoc")
+        .def(
+            "set_sdf_pose",
+            [](chysx::cloth::ClothSimulator& s,
+               py::array_t<float, py::array::c_style | py::array::forcecast> pos) {
+                if (pos.ndim() != 1 || pos.shape(0) != 3) {
+                    throw std::invalid_argument(
+                        "ClothSimulator.set_sdf_pose: pos must be a "
+                        "(3,) float32 vector");
+                }
+                s.sdf_volume().set_pose_translation(
+                    chysx::math::Vec3f(pos.at(0), pos.at(1), pos.at(2)));
+            },
+            py::arg("pos"),
+            R"pbdoc(
+Set the SDF body's world pose to a pure translation (identity
+rotation).  Use this every frame for translating bodies; combine
+with ``set_sdf_body_velocity`` so the friction slip cache uses
+relative tangential motion.
+
+Parameters
+----------
+pos : numpy.ndarray, shape (3,), dtype float32
+    World position of the body's local origin [m].
+)pbdoc")
+        .def(
+            "set_sdf_pose_full",
+            [](chysx::cloth::ClothSimulator& s,
+               py::array_t<float, py::array::c_style | py::array::forcecast> pos,
+               py::array_t<float, py::array::c_style | py::array::forcecast> ex,
+               py::array_t<float, py::array::c_style | py::array::forcecast> ey,
+               py::array_t<float, py::array::c_style | py::array::forcecast> ez) {
+                auto v3 = [](auto& a, const char* name) {
+                    if (a.ndim() != 1 || a.shape(0) != 3) {
+                        throw std::invalid_argument(
+                            std::string("ClothSimulator.set_sdf_pose_full: ") +
+                            name + " must be a (3,) float32 vector");
+                    }
+                    return chysx::math::Vec3f(a.at(0), a.at(1), a.at(2));
+                };
+                s.sdf_volume().set_pose(v3(pos, "pos"), v3(ex, "ex"),
+                                         v3(ey, "ey"), v3(ez, "ez"));
+            },
+            py::arg("pos"),
+            py::arg("ex"),
+            py::arg("ey"),
+            py::arg("ez"),
+            R"pbdoc(
+Set the SDF body's full world pose: position + the three orthonormal
+column vectors of its rotation matrix.  ``(ex, ey, ez)`` map the
+body's local +x/+y/+z axes into world space.  Use the simpler
+``set_sdf_pose(pos)`` if your body never rotates.
+)pbdoc")
+        .def(
+            "set_sdf_body_velocity",
+            [](chysx::cloth::ClothSimulator& s,
+               py::array_t<float, py::array::c_style | py::array::forcecast> v) {
+                if (v.ndim() != 1 || v.shape(0) != 3) {
+                    throw std::invalid_argument(
+                        "ClothSimulator.set_sdf_body_velocity: v must be a "
+                        "(3,) float32 vector");
+                }
+                s.sdf_contact().set_body_velocity(
+                    chysx::math::Vec3f(v.at(0), v.at(1), v.at(2)));
+            },
+            py::arg("v"),
+            R"pbdoc(
+Set the SDF body's linear velocity in world frame [m/s].  Subtracted
+from each cloth particle's velocity before projecting onto the
+contact tangent, so a particle riding the body sees zero spurious
+slip (and therefore zero spurious friction).  Default ``(0, 0, 0)``.
+)pbdoc")
+        .def("set_sdf_contact_thickness",
+             [](chysx::cloth::ClothSimulator& s, float t) {
+                 s.sdf_contact().set_thickness(t);
+             },
+             py::arg("thickness"),
+             "Contact distance threshold ``h`` [m] for the SDF body.  "
+             "Particles with ``sdf(x) < h`` are in contact.")
+        .def("sdf_contact_thickness",
+             [](const chysx::cloth::ClothSimulator& s) {
+                 return s.sdf_contact().thickness();
+             },
+             "Currently configured SDF contact thickness.")
+        .def("set_sdf_contact_stiffness",
+             [](chysx::cloth::ClothSimulator& s, float k) {
+                 s.sdf_contact().set_stiffness(k);
+             },
+             py::arg("stiffness"),
+             "Per-contact penalty stiffness ``k`` [N/m] for the SDF body.")
+        .def("sdf_contact_stiffness",
+             [](const chysx::cloth::ClothSimulator& s) {
+                 return s.sdf_contact().stiffness();
+             },
+             "Currently configured SDF contact stiffness.")
+        .def("set_sdf_contact_friction",
+             [](chysx::cloth::ClothSimulator& s, float mu) {
+                 s.sdf_contact().set_friction(mu);
+             },
+             py::arg("mu"),
+             "IPC-style Coulomb friction coefficient ``μ`` "
+             "(dimensionless) for the SDF body.  Zero disables friction.")
+        .def("sdf_contact_friction",
+             [](const chysx::cloth::ClothSimulator& s) {
+                 return s.sdf_contact().friction();
+             },
+             "Currently configured SDF Coulomb friction coefficient.")
+        .def("set_sdf_contact_friction_epsilon",
+             [](chysx::cloth::ClothSimulator& s, float eps_u) {
+                 s.sdf_contact().set_friction_epsilon(eps_u);
+             },
+             py::arg("eps_u"),
+             "Tangential slip regularisation distance ``ε_u`` [m] for "
+             "the SDF Coulomb friction model (default 1e-4).")
+        .def("sdf_contact_friction_epsilon",
+             [](const chysx::cloth::ClothSimulator& s) {
+                 return s.sdf_contact().friction_epsilon();
+             },
+             "Currently configured SDF friction regularisation ``ε_u``.")
+        .def("sdf_volume_active",
+             [](const chysx::cloth::ClothSimulator& s) {
+                 return s.sdf_volume().active();
+             },
+             "True if the SDF volume has been baked at least once.")
+        .def("sdf_volume_shape",
+             [](const chysx::cloth::ClothSimulator& s) {
+                 const auto& v = s.sdf_volume();
+                 return py::make_tuple(v.nx(), v.ny(), v.nz());
+             },
+             "(nx, ny, nz) voxel resolution of the baked SDF.")
         .def_property_readonly(
             "material",
             [](chysx::cloth::ClothSimulator& s) -> chysx::cloth::ClothMaterial& {

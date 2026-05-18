@@ -732,6 +732,16 @@ void ClothSimulator::step(float dt, std::uintptr_t cuda_stream) {
                                     0xffd35400);
             self_collision_detector_.detect(
                 x_n_span, self_collision_thickness_, cuda_stream);
+            // IPC Lagged-Newton friction needs a per-pair tangential
+            // slip cache.  Cheap (~1 kernel launch reading the same
+            // pairs/weights + 4 velocity loads per contact) and a
+            // no-op when friction is disabled.
+            if (self_collision_.friction() > 0.0f) {
+                self_collision_detector_.accumulate_slips(
+                    reinterpret_cast<const math::Vec3f*>(buffers_.vel.data()),
+                    dt,
+                    cuda_stream);
+            }
             self_collision_.accumulate_gradient(
                 self_collision_detector_, rhs_span, cuda_stream);
         }
@@ -761,14 +771,42 @@ void ClothSimulator::step(float dt, std::uintptr_t cuda_stream) {
         }
 
         // Static-shape contact (cloth ⇄ planes / boxes).  Detect at
-        // x_n (same rationale as self-collision) and scatter the
-        // penalty gradient onto the RHS now; the diagonal half is
-        // baked later in step block 5, after H_.set_zero().
+        // x_n (same rationale as self-collision), passing in the
+        // current velocity buffer so the IPC-style Coulomb friction
+        // can compute its lagged tangential slip
+        // `u_t = (v - n (n·v)) * dt`.  The penalty gradient is
+        // scattered onto the RHS now; the diagonal half (normal
+        // Gauss-Newton block + α·(I−nnᵀ) friction block) is baked
+        // later in step block 5, after H_.set_zero().
         if (static_contacts_.active()) {
             CHYSX_NVTX_RANGE_COLOUR("step::static_contact_detect",
                                     0xffc0392b);
-            static_contacts_.detect(x_n_.gpu_data(), n, cuda_stream);
+            static_contacts_.detect(
+                x_n_.gpu_data(),
+                n,
+                cuda_stream,
+                reinterpret_cast<const math::Vec3f*>(buffers_.vel.data()),
+                dt);
             static_contacts_.accumulate_gradient(
+                rhs_.gpu_data(), n, cuda_stream);
+        }
+
+        // SDF-volume contact (cloth ⇄ animated implicit body).  Same
+        // shape as the static-contact pass above, but the body's
+        // signed distance comes from a trilinear-sampled voxel grid
+        // and its rigid pose may move between frames; the slip cache
+        // uses the relative velocity `v_particle - v_body` so a
+        // particle riding the body experiences zero spurious slip.
+        if (sdf_contact_.active()) {
+            CHYSX_NVTX_RANGE_COLOUR("step::sdf_contact_detect",
+                                    0xff8e44ad);
+            sdf_contact_.detect(
+                x_n_.gpu_data(),
+                n,
+                cuda_stream,
+                reinterpret_cast<const math::Vec3f*>(buffers_.vel.data()),
+                dt);
+            sdf_contact_.accumulate_gradient(
                 rhs_.gpu_data(), n, cuda_stream);
         }
 
@@ -783,6 +821,32 @@ void ClothSimulator::step(float dt, std::uintptr_t cuda_stream) {
             reinterpret_cast<float3*>(rhs_.gpu_data()),
             n, inv_dt2);
         check_cuda(cudaGetLastError(), "assemble_rhs kernel launch");
+
+        // Coulomb-cone projection of the assembled Newton residual
+        // against the static-contact normals.  Runs HERE — after
+        // assemble_rhs has flipped the sign of g and added the
+        // inertial term — because that is the moment when rhs[p]
+        // first equals F_total = inertia + (-elastic_grad) + F_N.
+        // The projection internally subtracts the F_N it knows about
+        // (k·depth·n) to recover F0 = inertia + (-elastic_grad), then
+        // bends rhs so the tangential force lands inside μ·‖F0_n‖.
+        // Additive on top of the IPC stiffness friction baked in step
+        // block 5 — a no-op when friction() == 0.
+        if (static_contacts_.active()) {
+            CHYSX_NVTX_RANGE_COLOUR("step::static_contact_friction",
+                                    0xffe74c3c);
+            static_contacts_.apply_coulomb_friction(
+                rhs_.gpu_data(), n, cuda_stream);
+        }
+
+        // Coulomb-cone post-projection for the SDF body — same
+        // additive role as the static-contact pass above.
+        if (sdf_contact_.active()) {
+            CHYSX_NVTX_RANGE_COLOUR("step::sdf_contact_friction",
+                                    0xff9b59b6);
+            sdf_contact_.apply_coulomb_friction(
+                rhs_.gpu_data(), n, cuda_stream);
+        }
     }
 
     // ---- 4) (re)build Hessian topology if anything changed ----------
@@ -868,6 +932,14 @@ void ClothSimulator::step(float dt, std::uintptr_t cuda_stream) {
             CHYSX_NVTX_RANGE_COLOUR("step::static_contact_diag",
                                     0xffc0392b);
             static_contacts_.bake_diag(H_.diag.gpu_data(), n, dt, cuda_stream);
+        }
+
+        // SDF-volume contact diagonal — same role as the static
+        // contact bake, just sourced from the SDF detector cache.
+        if (sdf_contact_.active()) {
+            CHYSX_NVTX_RANGE_COLOUR("step::sdf_contact_diag",
+                                    0xff8e44ad);
+            sdf_contact_.bake_diag(H_.diag.gpu_data(), n, dt, cuda_stream);
         }
     }
 

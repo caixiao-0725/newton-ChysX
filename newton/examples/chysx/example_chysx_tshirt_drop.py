@@ -24,9 +24,14 @@
 #     entries on the static contact set.
 # 3.  Each step:
 #       * static-shape DCD adds penalty contributions to A's diagonal
-#         and to b (no off-diagonal sidecar);
-#       * self-collision (LBVH/QuantBvh broadphase + DCD narrow-phase)
+#         and to b (no off-diagonal sidecar); the IPC-style Coulomb
+#         ``static_contact_friction`` (μ, dimensionless) adds
+#         ``α (I - n n^T)`` with ``α = μ · f_n · f1_SF_over_x(‖u_t,lag‖)``
+#         on the diagonal for contacts with the table and ground;
+#       * self-collision (QuantBvh broadphase + DCD narrow-phase VF/EE)
 #         contributes through the existing COO sidecar;
+#       * **untangle** (5-vertex EF / ICM) — diagonal-only; reuses the
+#         self-collision BVH's EF candidate list;
 #       * PCG solves a single implicit-Euler Newton step;
 #       * positions and velocities are finalised in place.
 # 4.  After ~3 s the cloth has settled into a draped pose on the table.
@@ -46,6 +51,7 @@ from pxr import Usd
 import newton
 import newton.examples
 import newton.usd
+from newton.examples.chysx._camera import frame_z_up_camera_viewer
 
 
 def _load_centered_tshirt_m() -> tuple[np.ndarray, np.ndarray, float]:
@@ -91,7 +97,7 @@ class Example:
         # the implicit-Euler step well-conditioned; with 4 substeps
         # the impact velocity (~2 m/s) is too coarsely resolved and
         # produces a noticeable bounce in the first 0.3 s.
-        self.fps = 1000
+        self.fps = 100
         self.frame_dt = 1.0 / self.fps
         self.sim_substeps = 1
         self.sim_dt = self.frame_dt / self.sim_substeps
@@ -194,12 +200,24 @@ class Example:
         self_thickness   = 1.2e-3            # 3 mm
         static_thickness = 0.5 * edge_med    # ~5 mm
 
+        # ChysX static-shape friction is IPC-style Coulomb (Lagged-Newton
+        # linearisation, dimensionless μ).  ``0.3`` is in the range of
+        # cotton-on-lacquered-wood and lets the garment grip the table
+        # rather than sliding off; the bound ``‖f_t‖ ≤ μ·f_n`` keeps the
+        # tangential block from over-stiffening even with the example's
+        # generous ``dt = 10 ms`` (one substep at 100 fps).
+        static_friction = 0.03
+
         # Narrow-phase contact buffer.  ~6.4 k particles, expect
         # at most ~5 k VF/EE pairs at full collapse, so factor 8
         # (51 k cap) is plenty.  Broad-phase (LBVH-EF candidate)
         # traffic is ~4x narrow-phase, so factor 32.
         sc_narrow_factor = 32
         sc_broad_factor  = 128
+
+        # Untangle: same thickness band as proximity self-collision; stiffness
+        # 2× (style3d EF/VF ratio).  Requires self_collision_enabled=True.
+        untangle_k = 3.0 * 1.0e2
 
         self.solver = newton.solvers.SolverChysX(
             self.model,
@@ -210,17 +228,22 @@ class Example:
             damping=0.5,
             fem_stretch_stiffness=5.0e2,
             fem_shear_stiffness=5.0e2,
-            bending_stiffness=2.0e-4,
+            bending_stiffness=4.0e-5,
             pcg_iterations=50,
             surface_density=0.1,             # cuda-cloth tablecloth-like
             self_collision_enabled=True,
             self_collision_thickness=self_thickness,
-            self_collision_stiffness=5.0e3,
+            self_collision_stiffness=1.0e2,
             self_collision_max_contacts_factor=sc_narrow_factor,
             self_collision_max_ef_candidates_factor=sc_broad_factor,
             static_contact_enabled=True,
             static_contact_thickness=static_thickness,
             static_contact_stiffness=1.0e4,
+            static_contact_friction=static_friction,
+            untangle_enabled=True,
+            untangle_thickness=self_thickness,
+            untangle_stiffness=untangle_k,
+            untangle_max_contacts_factor=sc_narrow_factor,
         )
 
         self.state_0 = self.model.state()
@@ -231,11 +254,11 @@ class Example:
         self._initial_q = self.state_0.particle_q.numpy().reshape(-1, 3).copy()
 
         self.viewer.set_model(self.model)
-        self.viewer.set_camera(
-            pos=wp.vec3(1.6, -1.6, 1.4),
-            pitch=-22.0,
-            yaw=45.0,
-        )
+        q = self._initial_q
+        bmin = q.min(axis=0).astype(np.float64)
+        bmax = q.max(axis=0).astype(np.float64)
+        bmin[2] = min(float(bmin[2]), 0.0)
+        frame_z_up_camera_viewer(self.viewer, bmin, bmax)
 
         # ---- OBJ export (optional, off by default) ---------------------
         # ``--obj-out DIR`` writes one Wavefront OBJ per frame holding

@@ -44,11 +44,11 @@
 
 #include <cstdint>
 
-#include "../math/matrix.cuh"
-#include "../math/vec.cuh"
-#include "../memory/cuda_array.h"
-#include "../memory/device_span.h"
-#include "constraint_n.h"
+#include "../../math/matrix.cuh"
+#include "../../math/vec.cuh"
+#include "../../memory/cuda_array.h"
+#include "../../memory/device_span.h"
+#include "../core/constraint_n.h"
 
 namespace chysx {
 namespace constraint {

@@ -65,8 +65,29 @@ struct ContactSpMVOp {
     int                      max_contacts = 0;
     float                    stiffness    = 0.0f;
 
+    // IPC-style Lagged-Newton Coulomb friction.  When `friction_mu > 0`
+    // and `slips != nullptr`, the per-pair tangent block
+    //
+    //     α_c · w_i · w_j · (I - n_c n_c^T),  α_c = μ · k · depth_c
+    //                                              · f1_SF_over_x(‖u_t,c^lag‖)
+    //
+    // is folded into the SAME kernels that already touch
+    // `pairs / weights` (`bake_contact_diag`, `apply_contact_spmv`,
+    // `SelfCollisionConstraint::accumulate_gradient`) -- no extra
+    // launches, no extra reads of `pairs` / `weights` per contact.
+    //
+    // `slips[c] = (u_t.x, u_t.y, u_t.z, ‖u_t‖)` is owned by the
+    // detector that populated `pairs` / `weights` this step.
+    const math::Vec4f*       slips        = nullptr;
+    float                    friction_mu      = 0.0f;
+    float                    friction_epsilon = 1.0e-4f;
+
     bool active() const noexcept {
         return max_contacts > 0 && stiffness > 0.0f && pairs != nullptr;
+    }
+
+    bool friction_active() const noexcept {
+        return active() && friction_mu > 0.0f && slips != nullptr;
     }
 };
 

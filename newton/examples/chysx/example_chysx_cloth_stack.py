@@ -7,18 +7,19 @@
 # Two square cloth patches are released at staggered heights above a
 # tabletop and pile up under gravity, exercising chysx's *self-contact*
 # pipeline (cloth-on-cloth) and its *static-contact* pipeline with the
-# new viscous-friction term simultaneously.
+# IPC-style Coulomb friction simultaneously.
 #
 # The friction at the cloth/table interface is what makes a flat
 # tabletop hold a stack at all -- without friction, every off-vertical
 # contact normal between stacked sheets pushes them sideways with
 # nothing to oppose the slide, and they end up off the table edge
-# within a few seconds.  The implicit-Euler tangential damping
-# implemented as ``(μ_v / dt) * (I - n n^T)`` (see
-# :class:`chysx.collision.StaticContactSet`) drives tangential velocity
-# toward zero on contact, which is visually equivalent to dry friction
-# and lets us drop the basin walls the original draft of this example
-# needed.
+# within a few seconds.  The Lagged-Newton IPC Coulomb block baked into
+# A's diagonal as ``α · (I - n n^T)`` with
+# ``α = μ · f_n · f1_SF_over_x(‖u_t,lag‖)`` (see
+# :class:`chysx.collision.StaticContactSet`) self-caps the tangential
+# force at ``μ · f_n`` -- visually equivalent to dry friction without
+# the cost of an explicit cone projection, and lets us drop the basin
+# walls the original draft of this example needed.
 #
 # Trick: many patches as one cloth
 # --------------------------------
@@ -26,14 +27,14 @@
 # chysx's self-collision detector runs a single LBVH/QuantBvh pass over
 # *one* triangle mesh.  To get inter-sheet contacts "for free" we
 # pre-merge the patches on the host into one compound mesh:
-#
+# 
 #   * each patch is an 11x11 regular grid (121 verts, 200 triangles);
 #   * patch vertices are concatenated into one big array;
 #   * patch triangle indices are offset by the cumulative vertex count
 #     so they keep pointing at the right rows of the merged array;
 #   * the result is fed to ``builder.add_cloth_mesh()`` as a single
 #     cloth body.
-#
+# 
 # From the solver's perspective this is one cloth, so the BVH happily
 # emits VF / EE pairs across patch boundaries and the implicit-Euler
 # step resolves stack contacts in the same matrix solve as the
@@ -46,13 +47,15 @@
 #     they don't pile in a perfect column.
 # 2.  Build a Newton model with one static box (table top) and one
 #     ``add_ground_plane()``; ``SolverChysX`` registers both as static
-#     plane / box shapes (now with viscous friction enabled).
+#     plane / box shapes (IPC Coulomb friction optional).
 # 3.  Each step:
-#       * static-shape DCD adds ground/table penalties + tangential
-#         friction to A's diagonal and to b;
+#       * static-shape DCD adds ground/table penalties + the IPC
+#         Coulomb friction block to A's diagonal (gradient on b);
 #       * self-collision (LBVH/QuantBvh broadphase + DCD narrow-phase)
 #         contributes through the COO sidecar -- this is what couples
 #         the patches together;
+#       * **untangle** (5-vertex EF / ICM) — diagonal-only; reuses the
+#         self-collision BVH's EF candidate list;
 #       * PCG solves a single implicit-Euler Newton step.
 # 4.  After ~3 s the patches have settled into a soft pile on the
 #     tabletop.
@@ -70,6 +73,7 @@ import warp as wp
 
 import newton
 import newton.examples
+from newton.examples.chysx._camera import frame_z_up_camera_viewer
 
 
 def _make_square_patch(size: float, n: int) -> tuple[np.ndarray, np.ndarray]:
@@ -221,7 +225,7 @@ class Example:
         # scale the other chysx examples are tuned around.
         self._n_patches = 2
         self._patch_size = 0.3
-        self._n_per_side = 11
+        self._n_per_side = 101
         edge_l = self._patch_size / (self._n_per_side - 1)
         self._edge_l = edge_l
 
@@ -299,16 +303,40 @@ class Example:
         sc_narrow_factor = 64
         sc_broad_factor  = 128
 
-        # Static-contact viscous friction.  Picked so that
-        #   μ_v / dt ≈ 5x the per-particle penalty stiffness k_n
-        # at our 480 Hz substep rate; that is enough to bring the
-        # tangential velocity of a settled patch to within 1 % per
-        # frame ("sticking") while still letting the cloth slide
-        # noticeably during the impact transient.  The numerical
-        # value is small in absolute terms because each cloth
-        # particle is light (~75 mg) and only a handful of them
-        # are in contact with the table at a time.
-        static_friction = 1.0e-2               # N·s/m per particle
+        # IPC-style Coulomb friction with the static contact set.
+        # ``μ`` is the standard dimensionless Coulomb coefficient
+        # (~0.4 puts cloth in the "fabric on lacquered wood" regime --
+        # enough to hold the stack against the patch's own weight
+        # without producing a stick-slip jitter on the impact
+        # transient).  Self-capping at ``μ · f_n`` makes the value
+        # robust to the time step / contact stiffness pair in a way
+        # the previous viscous formulation (``μ_v / dt`` on the
+        # diagonal) was not -- raise μ here all the way to 1.0
+        # without re-tuning ``sim_substeps`` and the simulation
+        # remains stable.
+        static_friction = 0.4               # dimensionless Coulomb μ
+
+        # IPC-style Coulomb friction between every VF/EE self-contact
+        # pair (cloth-on-cloth).  Without it the patches glide off each
+        # other under the smallest gravity tilt -- a stack of slippery
+        # silk -- and the upper layers eventually slip past the lower
+        # ones into the table.  With μ = 0.4 (same regime as the
+        # static-contact value, cotton-on-cotton) the upper patches
+        # settle into a stable corner-aligned column instead.  The
+        # friction Hessian `α · (I - n n^T)` is folded into the same
+        # self-collision SpMV sidecar, so enabling it costs at most
+        # one Vec4f load per contact per pass + one cheap slip-cache
+        # kernel per step.
+        self_friction = 0.2                 # dimensionless Coulomb μ
+
+        # Untangle: same thickness band as proximity self-collision.
+        # Use stiffness equal to self-collision here (not the usual 2×
+        # EF/VF ratio from ``example_chysx_tshirt_drop``): two stacked
+        # patches sit in sustained sheet-on-sheet proximity and the
+        # stronger 2× ratio can excite false EF-cross impulses that
+        # blow the pile sideways; ``k_untangle == k_self`` still clears
+        # genuine inversions without fighting the proximity term.
+        untangle_k =  4.0 *1.0e2
 
         self.solver = newton.solvers.SolverChysX(
             self.model,
@@ -323,13 +351,18 @@ class Example:
             surface_density=0.2,              # ~18 g per 0.3 m square patch
             self_collision_enabled=True,
             self_collision_thickness=self_thickness,
-            self_collision_stiffness=1.0e3,
+            self_collision_stiffness=1.0e2,
+            self_collision_friction=self_friction,
             self_collision_max_contacts_factor=sc_narrow_factor,
             self_collision_max_ef_candidates_factor=sc_broad_factor,
             static_contact_enabled=True,
             static_contact_thickness=static_thickness,
-            static_contact_stiffness=1.0e4,
+            static_contact_stiffness=1.0e3,
             static_contact_friction=static_friction,
+            untangle_enabled=True,
+            untangle_thickness=self_thickness,
+            untangle_stiffness=untangle_k,
+            untangle_max_contacts_factor=sc_narrow_factor,
         )
 
         self.state_0 = self.model.state()
@@ -340,13 +373,11 @@ class Example:
         self._initial_q = self.state_0.particle_q.numpy().reshape(-1, 3).copy()
 
         self.viewer.set_model(self.model)
-        # Camera looking slightly down at the table from a 3/4 angle
-        # so the pile is visible from the side as it grows.
-        self.viewer.set_camera(
-            pos=wp.vec3(1.4, -1.4, 1.3),
-            pitch=-20.0,
-            yaw=45.0,
-        )
+        q = self._initial_q
+        bmin = q.min(axis=0).astype(np.float64)
+        bmax = q.max(axis=0).astype(np.float64)
+        bmin[2] = min(float(bmin[2]), 0.0)
+        frame_z_up_camera_viewer(self.viewer, bmin, bmax)
 
         print(
             f"[chysx_cloth_stack] {self._n_patches} patches "
@@ -355,7 +386,8 @@ class Example:
             f"{self._n_verts_total} verts / {self._n_tris_total} tris;  "
             f"self_thickness={self_thickness*1e3:.1f} mm,  "
             f"static_thickness={static_thickness*1e3:.1f} mm,  "
-            f"static_friction={static_friction:.1f} N·s/m,  "
+            f"self_friction(μ)={self_friction:.2f},  "
+            f"static_friction(μ)={static_friction:.2f},  "
             f"initial vertical spacing={dz*1e2:.1f} cm"
         )
 
@@ -387,8 +419,9 @@ class Example:
         # examples.  PCG topology depends only on the FEM mesh and
         # the static-shape registration, both of which are fixed at
         # construction; self-contact contributions ride through the
-        # device-side counter, so the graph stays valid frame-to-frame
-        # as the contact set grows from "nothing" to "patches piled".
+        # device-side counter; untangle is diagonal-only like static
+        # contact.  The graph stays valid frame-to-frame as the contact
+        # set grows from "nothing" to "patches piled".
         self._cuda_graph = None
         self._capture_graph()
 

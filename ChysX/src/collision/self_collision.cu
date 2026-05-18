@@ -196,6 +196,62 @@ __global__ void face_aabb_center_kernel(
 __global__ void clear_int_kernel(int* p) { *p = 0; }
 
 // ============================================================================
+// Friction slip cache  (Vec4f[c] = (u_t.x, u_t.y, u_t.z, ‖u_t‖))
+// ============================================================================
+//
+// One thread per contact pair.  Reads the same `pairs[c]` /
+// `weights[c]` that the gradient / Hessian scatter kernels read, so
+// the only NEW global-memory traffic per contact is four `float3`
+// velocity loads (cached in L1 because adjacent contacts share
+// vertices through `pairs_`) and one `Vec4f` slip write.
+//
+// `u_rel` is the relative velocity at the contact point in the
+// barycentric-weighted sign convention chysx already uses for the
+// gradient (VF: `(+1, -wa, -wb, -wc)`, EE: `(s, 1-s, -s, s-1)`),
+// so `u_rel = Σ_i w_i · v_i`.  Tangent projection then strips the
+// normal component and multiplies by `dt` to get the per-step
+// displacement Lagged-Newton needs.
+__global__ void scatter_slips_kernel(
+    const math::Vec4i* __restrict__ pairs,
+    const ContactWeights* __restrict__ weights,
+    const int* __restrict__ count_ptr,
+    const float3* __restrict__ velocities,
+    int max_contacts,
+    float dt,
+    math::Vec4f* __restrict__ slips) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= max_contacts) return;
+    const int n_raw = *count_ptr;
+    const int n = (n_raw < max_contacts) ? n_raw : max_contacts;
+    if (c >= n) {
+        // Inactive slot -- still write zero so any stray friction read
+        // (e.g. on the slots past the current count) is safe.
+        slips[c] = math::Vec4f(0.0f, 0.0f, 0.0f, 0.0f);
+        return;
+    }
+
+    const math::Vec4i ids = pairs[c];
+    const ContactWeights w = weights[c];
+
+    const float3 v0 = velocities[ids.x];
+    const float3 v1 = velocities[ids.y];
+    const float3 v2 = velocities[ids.z];
+    const float3 v3 = velocities[ids.w];
+
+    const float ux = w.w0 * v0.x + w.w1 * v1.x + w.w2 * v2.x + w.w3 * v3.x;
+    const float uy = w.w0 * v0.y + w.w1 * v1.y + w.w2 * v2.y + w.w3 * v3.y;
+    const float uz = w.w0 * v0.z + w.w1 * v1.z + w.w2 * v2.z + w.w3 * v3.z;
+
+    const float dn = ux * w.nx + uy * w.ny + uz * w.nz;
+    const float tx = (ux - dn * w.nx) * dt;
+    const float ty = (uy - dn * w.ny) * dt;
+    const float tz = (uz - dn * w.nz) * dt;
+    const float u_norm = sqrtf(tx * tx + ty * ty + tz * tz);
+
+    slips[c] = math::Vec4f(tx, ty, tz, u_norm);
+}
+
+// ============================================================================
 // Narrow-phase kernels
 // ============================================================================
 
@@ -481,6 +537,32 @@ void SelfCollisionDetector::detect(DeviceSpan<math::Vec3f> positions,
             weights_.gpu_data());
         check_cuda(cudaGetLastError(), "cull_ee_adjacent_kernel");
     }
+}
+
+void SelfCollisionDetector::accumulate_slips(const math::Vec3f* velocities,
+                                             float              dt,
+                                             std::uintptr_t     cuda_stream) {
+    if (velocities == nullptr || dt <= 0.0f) return;
+    if (topology_ == nullptr || !topology_->valid()) return;
+    if (max_contacts_ <= 0) return;
+
+    // Lazy-allocate the per-contact slip cache.  Sized to `max_contacts_`
+    // so we can index it with the same `c` the existing scatter / SpMV
+    // kernels use for `pairs_[c]` / `weights_[c]`.
+    if (slips_.gpu_size() != static_cast<std::size_t>(max_contacts_)) {
+        slips_.resize(static_cast<std::size_t>(max_contacts_));
+    }
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+    scatter_slips_kernel<<<grid_for(max_contacts_), kBlockDim, 0, stream>>>(
+        pairs_.gpu_data(),
+        weights_.gpu_data(),
+        count_.gpu_data(),
+        reinterpret_cast<const float3*>(velocities),
+        max_contacts_,
+        dt,
+        slips_.gpu_data());
+    check_cuda(cudaGetLastError(), "scatter_slips_kernel launch");
 }
 
 int SelfCollisionDetector::count(std::uintptr_t cuda_stream) {

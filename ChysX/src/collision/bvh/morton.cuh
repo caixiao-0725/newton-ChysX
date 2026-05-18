@@ -11,7 +11,7 @@
 
 #include <cstdint>
 
-#include "../math/common.cuh"
+#include "../../math/common.cuh"
 
 namespace chysx {
 namespace collision {

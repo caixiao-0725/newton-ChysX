@@ -9,8 +9,8 @@
 
 #pragma once
 
-#include "../math/common.cuh"
-#include "../math/vec.cuh"
+#include "../../math/common.cuh"
+#include "../../math/vec.cuh"
 
 namespace chysx {
 namespace collision {

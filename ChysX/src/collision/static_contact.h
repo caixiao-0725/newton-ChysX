@@ -137,21 +137,40 @@ public:
     void set_stiffness(float k) noexcept { stiffness_ = k; }
     float stiffness() const noexcept { return stiffness_; }
 
-    // Viscous tangential friction coefficient `μ_v` [N·s/m].  When
-    // non-zero, every particle in active contact gets the implicit
-    // tangential damping
+    // Coulomb friction coefficient `μ` (dimensionless).  When
+    // non-zero, every particle in active contact gets a Lagged-Newton
+    // linearisation of the IPC-style isotropic Coulomb friction
+    // (Li et al. 2020) baked onto the implicit-Euler Hessian:
     //
-    //     F_friction = -μ_v * (I - n n^T) * v_{n+1}
+    //     α_p           = μ · f_n,p · f1_SF_over_x(‖u_t,p^lag‖)
+    //     A_diag[p]    += α_p · (I - n n^T)
     //
-    // baked into the implicit-Euler Hessian -- no RHS contribution
-    // is needed because v_{n+1} is fully encoded by the unknown
-    // displacement.  At rest this drives the tangential velocity
-    // towards zero ("sticking"); under load it produces a
-    // velocity-proportional drag that looks visually like friction
-    // without forcing us to solve the full Coulomb cone.  Zero
-    // disables friction (default).
-    void set_friction(float mu_v) noexcept { friction_ = mu_v; }
+    // where `f_n,p = k · depth_p` is the normal load, `u_t,p^lag` is
+    // the tangential part of the previous step's particle displacement
+    // (`v · dt`) projected onto the contact tangent plane, and
+    // `f1_SF_over_x` smoothly ramps from `2/ε_u` at `‖u_t‖=0` to
+    // `1/‖u_t‖` once `‖u_t‖ > ε_u`.  The resulting tangential force at
+    // the solution `dx_t` is `f_t = -α_p · dx_t`, automatically bounded
+    // by `‖f_t‖ ≤ μ · f_n` (the Coulomb cone) without an explicit
+    // projection step.  Zero disables friction (default).
+    //
+    // Replaces the earlier viscous tangential damping (`μ_v` [N·s/m]):
+    // the previous formulation scaled like `μ_v / dt` on the diagonal
+    // and was unstable whenever `μ_v / dt` dwarfed `M / dt^2`.  The
+    // Coulomb model self-caps because the diagonal contribution decays
+    // proportionally to `1 / ‖u_t‖`, so a large `μ` no longer creates
+    // an over-stiff tangential block at standstill.
+    void set_friction(float mu) noexcept { friction_ = mu; }
     float friction() const noexcept { return friction_; }
+
+    // Tangential slip regularisation distance `ε_u` [m].  Sets the
+    // sticking band: tangential displacements smaller than `ε_u`
+    // produce a force linear in `dx_t` (with stiffness `μ·f_n / ε_u`),
+    // beyond `ε_u` the force saturates at the Coulomb limit `μ·f_n`.
+    // `1e-4` m is a reasonable default for cloth-on-table contact at
+    // millimetre cell sizes.
+    void set_friction_epsilon(float eps_u) noexcept { friction_epsilon_ = eps_u; }
+    float friction_epsilon() const noexcept { return friction_epsilon_; }
 
     // True if there is any work to do this step.
     bool active() const noexcept {
@@ -162,16 +181,26 @@ public:
 
     // Per-particle DCD against every plane + box.  After the call,
     // the internal cache holds the (depth, normal) of the *deepest*
-    // primitive penetration for each particle.  Particles outside
-    // every primitive get depth = 0; the grad / diag passes skip
-    // them in O(1) per particle.
+    // primitive penetration for each particle, plus -- when both
+    // `velocities` and `dt` are provided -- the lagged tangential
+    // slip `u_t = (v - n (n·v)) * dt` baked into a separate slip
+    // cache (consumed by `bake_diag` to evaluate the IPC-style
+    // friction block).  Particles outside every primitive get
+    // depth = 0; the grad / diag passes skip them in O(1) per
+    // particle.
     //
-    // `positions` is a device pointer to `n_particles` Vec3f, e.g.
-    // Newton's `state.particle_q.ptr` cast through `reinterpret_cast`.
-    // Throws if `n_particles <= 0` or `positions` is null.
+    // `positions` and `velocities` are device pointers to
+    // `n_particles` Vec3f, e.g. Newton's `state.particle_q.ptr` /
+    // `state.particle_qd.ptr` cast through `reinterpret_cast`.  When
+    // `velocities` is null or `dt <= 0`, the slip cache is zeroed
+    // and friction degenerates to the static-only branch (force
+    // linear in `dx_t` with stiffness `μ·f_n / ε_u`, capped at
+    // `μ·f_n`).  Throws if `n_particles <= 0` or `positions` is null.
     void detect(const math::Vec3f* positions,
                 int                n_particles,
-                std::uintptr_t     cuda_stream = 0);
+                std::uintptr_t     cuda_stream = 0,
+                const math::Vec3f* velocities  = nullptr,
+                float              dt          = 0.0f);
 
     // rhs[p] += -k * depth_p * n_p   (chysx's "+grad E" sign).
     //
@@ -181,13 +210,20 @@ public:
                              int             n_particles,
                              std::uintptr_t  cuda_stream = 0) const;
 
-    // A_diag[p] += k * (n_p n_p^T)  +  (μ_v / dt) * (I - n_p n_p^T).
+    // A_diag[p] += k * (n_p n_p^T)  +  α_p * (I - n_p n_p^T).
     //
     // The first term is the normal-force Gauss-Newton block; the
-    // second is the implicit-Euler tangential viscous-friction block
-    // and is skipped when `friction() == 0`.  ``dt`` is the simulation
-    // step size and is needed so the friction block has units
-    // consistent with the rest of A (= M/dt² + ...).
+    // second is the IPC-style Coulomb friction tangent block, with
+    //
+    //     α_p = μ · k · depth_p · f1_SF_over_x(‖u_t,p^lag‖)
+    //
+    // and `f1_SF_over_x` smoothly ramping from `2/ε_u` at zero slip
+    // to `1/‖u_t‖` past the regularisation band.  The friction block
+    // is skipped when `friction() == 0`, when no slip cache was
+    // populated by the last `detect()`, or when `depth_p <= 0`.
+    // ``dt`` is the simulation step size and is unused by the
+    // Coulomb block (kept as an argument so the call sites in
+    // ClothSimulator do not need a separate code path).
     //
     // Same precondition as `accumulate_gradient` — call with the same
     // `n_particles` that `detect()` last saw.
@@ -196,6 +232,53 @@ public:
                    float           dt,
                    std::uintptr_t  cuda_stream = 0) const;
 
+    // Coulomb-cone post-projection of the assembled Newton residual.
+    //
+    // To be called *after* `assemble_rhs_kernel` (and after this
+    // class' own `accumulate_gradient`).  At that point the per-
+    // particle right-hand side equals
+    //
+    //     rhs[p] = M_p · v_pred / dt  -  ∇E_elastic(x_n)
+    //              + k · depth_p · n_p          (penalty normal push)
+    //
+    // i.e. it is the *force* the linear solve will see (sign flipped
+    // from the gradient stage).  We reconstruct the user's "F0" — the
+    // inertial + elastic force, *without* the penalty normal — by
+    // subtracting the penalty contribution we just added:
+    //
+    //     F0_p = rhs[p] - k · depth_p · n_p.
+    //
+    // The friction normal load is then estimated from F0's component
+    // pushing into the boundary:
+    //
+    //     f_n_mag = max(0, -dot(F0_p, n_p)).
+    //
+    // (Using `f_n_mag = k · depth_p` would couple the cone radius to
+    // a transient penalty depth that has not yet been resisted; using
+    // the inertial-elastic load is what physical Coulomb friction
+    // measures and is what cuda-cloth's friction project also does.)
+    //
+    // The Coulomb-cone projection then operates on F0's tangential
+    // component `F0_t = F0 - dot(F0, n) · n`:
+    //
+    //     stick (‖F0_t‖ ≤ μ · f_n_mag):  Δf = -F0_t       — cancels slip
+    //     slip  (‖F0_t‖ >  μ · f_n_mag): Δf = -μ · f_n_mag · F0_t/‖F0_t‖
+    //
+    // and adds `Δf` to `rhs[p]`.  This is *additive* on top of the
+    // IPC-style stiffness friction baked by `bake_diag` — the IPC
+    // term acts as implicit damping in the linear system, while this
+    // pass strictly enforces the Coulomb cone on the assembled force.
+    //
+    // No-op when `friction() <= 0`, when there is no active contact at
+    // a particle, or when F0 is pulling the particle *away* from the
+    // boundary (`f_n_mag = 0` ⇒ no friction allowed).
+    //
+    // Same precondition as `accumulate_gradient` — call with the same
+    // `n_particles` that `detect()` last saw.
+    void apply_coulomb_friction(math::Vec3f*    rhs,
+                                int             n_particles,
+                                std::uintptr_t  cuda_stream = 0) const;
+
 private:
     void upload_shapes_();
 
@@ -203,9 +286,11 @@ private:
     int   n_boxes_  = 0;
     float thickness_ = 0.0f;
     float stiffness_ = 0.0f;
-    float friction_  = 0.0f;
+    float friction_         = 0.0f;
+    float friction_epsilon_ = 1.0e-4f;
     bool  shapes_dirty_ = false;
     int   cached_n_particles_ = 0;
+    bool  cached_has_slip_    = false;  // last detect() saw velocities
 
     // Host + device staging.  Tiny shape counts mean reallocating on
     // every add_*() is fine (cloth scenes have a handful of primitives).
@@ -216,6 +301,11 @@ private:
     // detect / scatter / bake kernels can load it as a single 16-byte
     // vector and skip-if-inactive in one branch.
     CudaArray<math::Vec4f> contacts_;
+
+    // Per-particle (ux, uy, uz, ‖u_t‖) lagged tangential slip,
+    // computed inside `detect_kernel` when velocities are provided.
+    // Zero (and ignored) for the velocity-less code path.
+    CudaArray<math::Vec4f> slips_;
 };
 
 }  // namespace collision

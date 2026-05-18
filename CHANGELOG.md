@@ -39,11 +39,14 @@
 - Add frame-by-frame step support to `ViewerGL`: press `.` while paused to advance one simulation frame
 - Add ViewerBase.should_step() — call once per frame to determine whether the simulation loop should advance; returns True when not paused.
 - Add Kamino-specific simulation examples in `newton/examples/kamino`
+- Add ChysX example `chysx_cloth_pin_rain` (pinned four-corner sheet + `--num-small` cloth squares dropped from above).
+- Add IPC-style smooth Coulomb friction at cloth self-contact (VF + EE pairs) in `SolverChysX` via the new `self_collision_friction` (dimensionless `μ`, default `0`) and `self_collision_friction_epsilon` (slip regularisation distance `ε_u` [m], default `1e-4`) parameters. The friction Hessian (`α · (I - n n^T)` blocks) and gradient (`-α · w_i · u_t^lag` per particle) are folded into the existing self-collision SpMV sidecar and gradient scatter (`bake_contact_diag` / `apply_contact_spmv` / `SelfCollisionConstraint::accumulate_gradient`), reusing the same `pairs / weights / normal / w_i` loads -- enabling friction adds at most one Vec4f load per contact per pass and one small slip-cache kernel per step, with no new sparsity pattern. `α = μ · k · depth · f1_SF_over_x(‖u_t,lag‖)` saturates at the Coulomb limit `μ · f_n` past `ε_u`.
 - Add per-mesh `color` override to `ViewerBase.log_mesh()` for tinting individual meshes without authoring per-vertex colors
 - Add per-mesh `roughness` and `metallic` PBR overrides to `ViewerBase.log_mesh()`
 
 ### Changed
 
+- Replace ChysX `SolverChysX(static_contact_friction=...)` viscous tangential damping with IPC-style Lagged-Newton Coulomb friction. The parameter is now a dimensionless Coulomb coefficient `μ` (was `μ_v` in [N·s/m]); `α · (I - n n^T)` is baked onto A's diagonal with `α = μ · f_n · f1_SF_over_x(‖u_t,lag‖)` and the resulting tangential force is automatically bounded by `‖f_t‖ ≤ μ · f_n` without an explicit cone projection. Adds the companion `static_contact_friction_epsilon` (slip regularisation distance, default `1e-4 m`). Migration: replace previous `static_contact_friction=μ_v` (e.g. `1.0` N·s/m for `example_chysx_cloth_stack`, `1e-2` N·s/m for `example_chysx_tshirt_drop`) with a dimensionless `μ` (now `0.4` and `0.3` respectively in the examples).
 - Use pre-computed local AABB for `CONVEX_MESH` shapes in `compute_shape_aabbs`, avoiding a per-frame support-function AABB computation
 - Build mesh SDFs via the texture-based sparse path only; sample via `SDF.texture_data` instead of `SDF.sparse_volume` / `SDF.coarse_volume`.
 - Change implicit MPM default `solver` from `"gs"` to `"auto"`, which selects `"gs"` for trilinear bases and `"gs-batched"` for higher-order ones. Set `solver="gs"` explicitly to restore the previous behavior.

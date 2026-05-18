@@ -40,6 +40,7 @@ import warp as wp
 
 import newton
 import newton.examples
+from newton.examples.chysx._camera import frame_z_up_camera_viewer
 
 
 class Example:
@@ -48,9 +49,9 @@ class Example:
         # 60 fps render with 4 substeps -> 240 Hz physics, the smallest
         # rate where stiff (k=1e4) ground / table contacts stay
         # well-conditioned for the default PCG iteration count.
-        self.fps = 60
+        self.fps = 100
         self.frame_dt = 1.0 / self.fps
-        self.sim_substeps = 4
+        self.sim_substeps = 1
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.sim_time = 0.0
 
@@ -144,8 +145,8 @@ class Example:
             self_collision_enabled=True,
             self_collision_thickness=thickness,
             self_collision_stiffness=1.0e3,
-            self_collision_max_contacts_factor=8,
-            self_collision_max_ef_candidates_factor=32,
+            self_collision_max_contacts_factor=32,
+            self_collision_max_ef_candidates_factor=128,
             static_contact_enabled=True,
             static_contact_thickness=thickness,
             static_contact_stiffness=1.0e4,
@@ -159,13 +160,11 @@ class Example:
         self._initial_q = self.state_0.particle_q.numpy().reshape(-1, 3).copy()
 
         self.viewer.set_model(self.model)
-        # Camera looking slightly down at the table; the cloth drape
-        # over the edge is the most interesting view.
-        self.viewer.set_camera(
-            pos=wp.vec3(1.6, -1.6, 1.2),
-            pitch=-15.0,
-            yaw=45.0,
-        )
+        q = self._initial_q
+        bmin = q.min(axis=0).astype(np.float64)
+        bmax = q.max(axis=0).astype(np.float64)
+        bmin[2] = min(float(bmin[2]), 0.0)
+        frame_z_up_camera_viewer(self.viewer, bmin, bmax)
 
         # ---- CUDA Graph capture ----------------------------------------
         #

@@ -52,8 +52,8 @@
 
 #include <cstdint>
 
-#include "../math/vec.cuh"
-#include "../memory/cuda_array.h"
+#include "../../math/vec.cuh"
+#include "../../memory/cuda_array.h"
 #include "aabb.cuh"
 
 namespace chysx {
