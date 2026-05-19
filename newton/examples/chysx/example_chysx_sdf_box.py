@@ -255,8 +255,7 @@ class Example:
             voxel_size=self._voxel_size,
             thickness=contact_thickness,
             stiffness=1.0e3,
-            friction=0.2,                       # was 0.4 — see note above
-            friction_epsilon=1.0e-4,
+            friction=0.2,
         )
         # Initial pose: box centre at (0, 0, box_z_initial + hz).
         self._box_pos = np.array(

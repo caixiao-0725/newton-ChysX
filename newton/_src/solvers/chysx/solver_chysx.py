@@ -647,7 +647,6 @@ class SolverChysX(SolverBase):
         thickness: float = 0.0,
         stiffness: float = 1.0e4,
         friction: float = 0.0,
-        friction_epsilon: float = 1.0e-4,
     ) -> int:
         """Bake an analytic axis-aligned box SDF into one of the
         simulator's owned ``SdfVolume`` slots and configure the
@@ -690,9 +689,7 @@ class SolverChysX(SolverBase):
         ``stiffness``
             Per-contact penalty stiffness ``k`` [N/m].
         ``friction``
-            IPC-style Coulomb friction coefficient ``μ`` (dimensionless).
-        ``friction_epsilon``
-            Tangential slip regularisation distance ``ε_u`` [m].
+            Coulomb friction coefficient ``μ`` (dimensionless).
 
         Returns
         -------
@@ -750,8 +747,6 @@ class SolverChysX(SolverBase):
         self._sim.set_sdf_contact_thickness(int(volume_index), float(thickness))
         self._sim.set_sdf_contact_stiffness(int(volume_index), float(stiffness))
         self._sim.set_sdf_contact_friction(int(volume_index), float(friction))
-        self._sim.set_sdf_contact_friction_epsilon(
-            int(volume_index), float(friction_epsilon))
         return int(volume_index)
 
     def set_sdf_pose(

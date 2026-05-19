@@ -258,8 +258,6 @@ class Example:
                 # Larger ε_u softens the IPC slip-to-stick ramp; with
                 # ε_u=5e-4 the per-particle tangential stiffness was
                 # large enough that voxel-grid normal jitter excited
-                # a persistent buzz once the jaws stopped moving.
-                friction_epsilon=2.0e-3,
             )
             self._jaw_volume_ids.append(vid)
 

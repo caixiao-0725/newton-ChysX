@@ -137,7 +137,6 @@ class Example:
             thickness=contact_thickness,
             stiffness=1.0e4,
             friction=1.0,
-            friction_epsilon=1.0e-3,
         )
 
         self._box_pos = np.array(

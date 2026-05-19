@@ -783,21 +783,6 @@ spurious slip (and therefore zero spurious friction).  Default
              },
              py::arg("volume_index"),
              "Currently configured SDF Coulomb friction coefficient.")
-        .def("set_sdf_contact_friction_epsilon",
-             [](chysx::cloth::ClothSimulator& s, int volume_index, float eps_u) {
-                 s.sdf_contact(volume_index).set_friction_epsilon(eps_u);
-             },
-             py::arg("volume_index"),
-             py::arg("eps_u"),
-             "Tangential slip regularisation distance ``ε_u`` [m] for "
-             "SDF body ``volume_index``'s Coulomb friction model "
-             "(default 1e-4).")
-        .def("sdf_contact_friction_epsilon",
-             [](const chysx::cloth::ClothSimulator& s, int volume_index) {
-                 return s.sdf_contact(volume_index).friction_epsilon();
-             },
-             py::arg("volume_index"),
-             "Currently configured SDF friction regularisation ``ε_u``.")
         .def("sdf_volume_active",
              [](const chysx::cloth::ClothSimulator& s, int volume_index) {
                  return s.sdf_volume(volume_index).active();

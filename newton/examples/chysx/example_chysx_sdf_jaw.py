@@ -147,7 +147,6 @@ class Example:
                 thickness=contact_thickness,
                 stiffness=1.0e4,
                 friction=1.0,
-                friction_epsilon=2.0e-3,
             )
             self._jaw_volume_ids.append(vid)
 
