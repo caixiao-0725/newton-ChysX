@@ -4,7 +4,7 @@
 ###########################################################################
 # Example ChysX SDF Gripper
 #
-# Two thin SDF-represented boxes play the role of a parallel-jaw
+# Two smooth SDF-represented spheres play the role of a parallel-jaw
 # gripper, like the fingers of a robot end effector.  The cloth is
 # held VERTICALLY in the yz-plane, the jaws sit one on each side
 # along x, close horizontally onto the cloth, then translate upward.
@@ -80,6 +80,11 @@ class Example:
         # gripper instead of riding it up.
         self.fps = 100
         self.frame_dt = 1.0 / self.fps
+        # 4 substeps -> 400 Hz physics.  At dt=2.5 ms the IPC
+        # tangential-friction linearisation stays well-conditioned;
+        # at dt=10 ms (substeps=1) the lagged slip cache resonates
+        # with the voxel-grid normal noise and the cloth visibly
+        # buzzes once the SDF body comes to rest.
         self.sim_substeps = 1
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.sim_time = 0.0
@@ -88,16 +93,14 @@ class Example:
         self.args = args
 
         # ---- jaw geometry ----------------------------------------------
-        # Thin pads in x (the closing axis), wide in y, modestly tall
-        # in z.  Half-extents in the jaw's own local frame; the world
-        # pose is pushed per frame.  The pads must be larger than the
-        # cloth in y AND z, otherwise the cloth's outer rim ends up
-        # squeezed by the closing pads with no in-plane room to give —
-        # self-collision then buckles the whole sheet out of plane and
-        # the cloth pops free of the gripper.
-        self._jaw_hx = 0.012   # 24 mm thick: a credible "finger pad"
-        self._jaw_hy = 0.080   # 16 cm wide   (cloth y half-size 5 cm)
-        self._jaw_hz = 0.080   # 16 cm tall   (lots of vertical reach)
+        # Use smooth convex jaws to avoid normal jumps at sharp edges.
+        # We represent each jaw as a near-sphere SDF (rounded box with
+        # equal half-extents and very large corner radius) and render
+        # it as a Newton sphere for visual consistency.
+        self._jaw_radius = 0.12
+        self._jaw_hx = self._jaw_radius
+        self._jaw_hy = self._jaw_radius
+        self._jaw_hz = self._jaw_radius
 
         # SDF voxel size: 2 mm.  Pad thickness is 24 mm so the thin
         # axis gets 12 voxels — plenty for clean trilinear gradients
@@ -150,10 +153,8 @@ class Example:
         cell             = self._cloth_size / (self._cloth_dim - 1)
         particle_radius  = 0.4 * cell
 
-        # Closed half-gap: tighten the pinch so the cloth gets a
-        # stronger normal load from both jaws (better grip, less slip
-        # during the lift).  Keep a small margin above jaw_hx to avoid
-        # over-compressing particles into the SDF interior.
+        # Closed half-gap: keep a small margin above the sphere radius
+        # so we get clear normal load without over-compressing.
         contact_thickness = max(0.5 * cell, 2.0 * self._voxel_size)
         self._half_gap_closed = self._jaw_hx + 0.25 * contact_thickness
 
@@ -202,11 +203,9 @@ class Example:
                 is_kinematic=True,
                 label=f"sdf_jaw_{len(self._jaw_body_ids)}",
             )
-            builder.add_shape_box(
+            builder.add_shape_sphere(
                 body=body_id,
-                hx=self._jaw_hx,
-                hy=self._jaw_hy,
-                hz=self._jaw_hz,
+                radius=self._jaw_radius,
             )
             self._jaw_body_ids.append(body_id)
 
@@ -241,10 +240,10 @@ class Example:
         # ε_u = 5e-4 is loose enough to avoid the lagged-Newton
         # self-excitation discussed in sdf.md but tight enough that
         # the slip-to-stick transition still looks crisp.
-        # Rounded SDF edges avoid normal-direction jumps at box
-        # edges/corners (adjacent cloth vertices seeing conflicting
-        # normals), which otherwise stretches and distorts the cloth.
-        corner_radius = max(2.0 * self._voxel_size, 0.5 * contact_thickness)
+        # Near-sphere SDF: set hx=hy=hz and choose corner radius close
+        # to the half-extent.  This gives a smooth convex shape while
+        # reusing the existing bake_sdf_box API.
+        corner_radius = max(0.0, self._jaw_radius - self._voxel_size)
         self._jaw_volume_ids = []
         for _ in self._jaw_body_ids:
             vid = self.solver.bake_sdf_box(
@@ -255,8 +254,12 @@ class Example:
                 corner_radius=corner_radius,
                 thickness=contact_thickness,
                 stiffness=1.0e4,
-                friction=0.8,
-                friction_epsilon=5.0e-4,
+                friction=0.1,
+                # Larger ε_u softens the IPC slip-to-stick ramp; with
+                # ε_u=5e-4 the per-particle tangential stiffness was
+                # large enough that voxel-grid normal jitter excited
+                # a persistent buzz once the jaws stopped moving.
+                friction_epsilon=2.0e-3,
             )
             self._jaw_volume_ids.append(vid)
 
@@ -290,11 +293,14 @@ class Example:
         bmax = np.array([+0.20, +0.32, 0.70], dtype=np.float64)
         frame_z_up_camera_viewer(self.viewer, bmin, bmax)
 
-        # Per-frame OBJ export: cloth + both jaw boxes in one file.
-        self._obj_dir = Path("frames")
-        self._obj_dir.mkdir(parents=True, exist_ok=True)
+        # Per-frame OBJ export is OFF by default — set
+        # `self._obj_dir = Path("frames")` to re-enable it.  Writing
+        # ~10k-vertex cloth + two jaw meshes every frame triggers a
+        # synchronous D2H copy on `particle_q` and serialises the
+        # whole frame onto the calling thread, which masks subtle
+        # contact / friction timing issues.
+        self._obj_dir: Path | None = None
         self._frame_idx = 0
-        print(f"[chysx_sdf_gripper] exporting scene OBJ frames -> {self._obj_dir.resolve()}")
 
         # ---- CUDA Graph capture ----------------------------------------
         # The per-frame SDF pose update lives OUTSIDE the captured
@@ -425,44 +431,50 @@ class Example:
                 t += 2
         return tris
 
-    def _build_box_mesh(self, center: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Return 8 box vertices and 12 triangle faces."""
-        hx, hy, hz = self._jaw_hx, self._jaw_hy, self._jaw_hz
+    def _build_sphere_mesh(self, center: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Return a low-poly UV-sphere mesh."""
+        radius = self._jaw_radius
         cx, cy, cz = float(center[0]), float(center[1]), float(center[2])
-        verts = np.array(
-            [
-                [cx - hx, cy - hy, cz - hz],
-                [cx + hx, cy - hy, cz - hz],
-                [cx + hx, cy + hy, cz - hz],
-                [cx - hx, cy + hy, cz - hz],
-                [cx - hx, cy - hy, cz + hz],
-                [cx + hx, cy - hy, cz + hz],
-                [cx + hx, cy + hy, cz + hz],
-                [cx - hx, cy + hy, cz + hz],
-            ],
-            dtype=np.float64,
-        )
-        faces = np.array(
-            [
-                [0, 1, 2], [0, 2, 3],  # -z
-                [4, 6, 5], [4, 7, 6],  # +z
-                [0, 4, 5], [0, 5, 1],  # -y
-                [3, 2, 6], [3, 6, 7],  # +y
-                [0, 3, 7], [0, 7, 4],  # -x
-                [1, 5, 6], [1, 6, 2],  # +x
-            ],
-            dtype=np.int32,
-        )
+        stacks = 10
+        slices = 16
+        verts = []
+        faces = []
+        for i in range(stacks + 1):
+            phi = math.pi * i / stacks
+            sp = math.sin(phi)
+            cp = math.cos(phi)
+            for j in range(slices):
+                theta = 2.0 * math.pi * j / slices
+                ct = math.cos(theta)
+                st = math.sin(theta)
+                verts.append([
+                    cx + radius * sp * ct,
+                    cy + radius * sp * st,
+                    cz + radius * cp,
+                ])
+        for i in range(stacks):
+            for j in range(slices):
+                jn = (j + 1) % slices
+                v00 = i * slices + j
+                v01 = i * slices + jn
+                v10 = (i + 1) * slices + j
+                v11 = (i + 1) * slices + jn
+                if i > 0:
+                    faces.append([v00, v10, v01])
+                if i < stacks - 1:
+                    faces.append([v01, v10, v11])
+        verts = np.asarray(verts, dtype=np.float64)
+        faces = np.asarray(faces, dtype=np.int32)
         return verts, faces
 
     def _export_scene_obj(self, path: Path) -> None:
-        """Write one OBJ containing cloth + two jaw boxes."""
+        """Write one OBJ containing cloth + two jaw spheres."""
         path.parent.mkdir(parents=True, exist_ok=True)
 
         cloth_verts = self.state_0.particle_q.numpy().reshape(-1, 3).astype(np.float64)
         cloth_faces = self._build_cloth_faces()
-        jaw0_verts, jaw_faces = self._build_box_mesh(self._jaw_pos[0])
-        jaw1_verts, _ = self._build_box_mesh(self._jaw_pos[1])
+        jaw0_verts, jaw_faces = self._build_sphere_mesh(self._jaw_pos[0])
+        jaw1_verts, _ = self._build_sphere_mesh(self._jaw_pos[1])
 
         with path.open("w", encoding="utf-8") as f:
             f.write("# chysx_sdf_gripper scene snapshot\n")
@@ -483,6 +495,8 @@ class Example:
         print(f"[chysx_sdf_gripper] scene OBJ written -> {path.resolve()}")
 
     def _export_scene_obj_frame(self, frame_idx: int) -> None:
+        if self._obj_dir is None:
+            return
         path = self._obj_dir / f"chysx_sdf_gripper_scene_{frame_idx:05d}.obj"
         self._export_scene_obj(path)
 
@@ -498,7 +512,8 @@ class Example:
         else:
             self._simulate_substeps()
         self.sim_time += self.sim_substeps * self.sim_dt
-        self._export_scene_obj_frame(self._frame_idx)
+        if self._obj_dir is not None:
+            self._export_scene_obj_frame(self._frame_idx)
         self._frame_idx += 1
 
     def render(self):

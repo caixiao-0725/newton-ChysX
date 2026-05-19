@@ -126,6 +126,7 @@ __global__ void scatter_gradient_kernel(
     float                           stiffness,
     float                           friction_mu,
     float                           friction_epsilon,
+    float                           thickness,
     math::Vec3f* __restrict__       rhs) {
     const int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= n_particles) return;
@@ -140,30 +141,14 @@ __global__ void scatter_gradient_kernel(
     rhs[p].z += kd * c.z;
 
     if (friction_mu > 0.0f && slips != nullptr) {
-        const float f_n = stiffness * depth;
+        // Use a depth floor for friction alpha so that particles at
+        // shallow penetration still experience meaningful friction.
+        const float depth_fric = fmaxf(depth, 0.1f * thickness);
+        const float f_n = stiffness * depth_fric;
         const math::Vec4f slip = slips[p];
         const float u_norm = slip.w;
         const float f1 = f1_sf_over_x(u_norm, friction_epsilon);
         const float alpha = friction_mu * f_n * f1;
-        // IPC lagged-Newton friction.  `slip = (v_p - v_body) · dt`
-        // projected onto the tangent plane, i.e. the world-frame
-        // tangential displacement the cloth particle WOULD undergo
-        // this step *relative to the body* if no friction acted.
-        // The linearised friction reaction wants to cancel that
-        // relative motion, so it adds  +α · slip  to the *gradient*
-        // (the negative of the friction force).  `assemble_rhs`
-        // later flips the sign of the gradient when folding it into
-        // the Newton residual; the net effect on the final RHS is
-        //   rhs +=  -α · slip = +α · (v_body − v_p) · dt_t
-        // which pulls the particle toward the body in the tangent
-        // plane — exactly the direction needed to "stick" the cloth
-        // to a moving SDF jaw.
-        //
-        // The previous version had this with the opposite sign,
-        // which (for a stationary particle on an upward-moving jaw)
-        // dragged the cloth *downward* and made the gripper unable
-        // to lift its cargo.  See `example_chysx_sdf_gripper.py`
-        // for the regression that surfaced this.
         rhs[p].x += alpha * slip.x;
         rhs[p].y += alpha * slip.y;
         rhs[p].z += alpha * slip.z;
@@ -179,6 +164,7 @@ __global__ void bake_diag_kernel(
     float                           stiffness,
     float                           friction_mu,
     float                           friction_epsilon,
+    float                           thickness,
     math::Mat3f* __restrict__       diag) {
     const int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= n_particles) return;
@@ -200,7 +186,8 @@ __global__ void bake_diag_kernel(
     float a22 = k * nz * nz;
 
     if (friction_mu > 0.0f) {
-        const float f_n = k * depth;
+        const float depth_fric = fmaxf(depth, 0.1f * thickness);
+        const float f_n = k * depth_fric;
         const float u_norm = (slips != nullptr) ? slips[p].w : 0.0f;
         const float f1 = f1_sf_over_x(u_norm, friction_epsilon);
         const float alpha = friction_mu * f_n * f1;
@@ -225,13 +212,48 @@ __global__ void bake_diag_kernel(
 }
 
 // Coulomb-cone post-projection on the assembled Newton residual.
-// Mirrors static_contact's apply_coulomb_friction_kernel exactly.
+//
+// Unified logic for both static and moving bodies.  The key insight:
+// `scatter_gradient_kernel` already injected `+α · slip` into the
+// gradient, where `slip = (v_particle - v_body) · dt` projected onto
+// the tangent plane.  After `assemble_rhs` flips the sign, the
+// friction contribution in the final rhs is  `-α · slip`.
+//
+// When computing F0 (the force excluding the penalty normal push),
+// we subtract out the friction force arising from the *body's own
+// velocity* component of the slip.  This ensures the Coulomb-cone
+// check measures the particle's *relative* tangential force with
+// respect to the body, not the absolute force.  A particle riding
+// the body at the same velocity will then have F0_t ≈ 0, landing
+// in the STICK branch, which zeroes the residual tangential force —
+// correctly pinning the particle to the moving body.
+//
+// Coulomb-cone post-projection on the assembled Newton residual.
+//
+// STICK branch: replace the tangential rhs so the PCG solves
+// dx_t = v_body_t · dt, making the particle ride the body exactly.
+//
+//   target rhs_t = (M/dt² + alpha) · v_body_t · dt + M · g_t
+//                = M · v_body_t / dt + alpha · v_body_t · dt + M · g_t
+//
+// SLIDING branch: project F0_t onto the Coulomb-cone boundary.
+//
+// Cone uses  max(depth, 0.1·thickness)  so shallow-penetration
+// particles still experience meaningful friction.
 __global__ void apply_coulomb_friction_kernel(
-    const math::Vec4f* __restrict__ contacts,
-    int                             n_particles,
-    float                           stiffness,
-    float                           friction_mu,
-    math::Vec3f* __restrict__       rhs) {
+    const math::Vec4f* __restrict__  contacts,
+    const math::Vec4f* __restrict__  slips,
+    int                              n_particles,
+    float                            stiffness,
+    float                            friction_mu,
+    float                            friction_epsilon,
+    float                            thickness,
+    const math::Vec3f* __restrict__  body_velocity_dev,
+    const float* __restrict__        mass,
+    float3                           gravity,
+    float                            inv_dt2,
+    float                            dt,
+    math::Vec3f* __restrict__        rhs) {
     const int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= n_particles) return;
 
@@ -244,15 +266,68 @@ __global__ void apply_coulomb_friction_kernel(
     const float ny = c.y;
     const float nz = c.z;
 
+    // --- Compute the body-velocity part of the friction force that
+    //     scatter_gradient injected into the rhs ---
+    //
+    // scatter_gradient added:  grad += alpha * slip_vec
+    // where slip_vec = (v_p - v_body)*dt projected tangentially.
+    // After assemble_rhs flips sign, rhs gets:
+    //   rhs += -alpha * slip_vec = alpha*v_body_t*dt - alpha*v_p_t*dt
+    //
+    // The body-velocity part is  alpha * v_body_t * dt.  But we must
+    // compute it using the SAME alpha that scatter_gradient used, and
+    // crucially: when slip_vec = 0 (v_p = v_body), scatter injected
+    // NOTHING, so the body part is also 0.
+    //
+    // To stay consistent, we decompose the actual scatter contribution:
+    //   scatter_force_in_rhs = -alpha * slip_vec   (after sign flip)
+    //   body_part            = -alpha * (-v_body_t*dt)  [tangential only]
+    //
+    // But since slip_vec might be 0 even though v_body ≠ 0, we scale
+    // by the ratio (slip coming from body) / (total slip).  The cleanest
+    // approach: body_part = scatter_total + particle_part, where
+    // particle_part = -alpha * v_p_t * dt.  But we don't know v_p_t.
+    //
+    // Simplest correct fix: recompute body_part as  alpha * v_body_t * dt
+    // but use the CLAMPED f1 that avoids the 1/eps singularity when
+    // slip → 0.  When slip=0 the particle is already riding the body,
+    // so f_body should equal the rhs contribution (which is 0).
+    // We achieve this by scaling f_body by (slip_norm / max(slip_norm, eps)):
+    // at slip=0 the factor is 0 → f_body=0; at slip >> eps the factor → 1.
+    float f_body_x = 0.0f, f_body_y = 0.0f, f_body_z = 0.0f;
+    if (slips != nullptr && dt > 0.0f) {
+        const math::Vec3f vb = body_velocity_dev[0];
+        const float vb_n = vb.x * nx + vb.y * ny + vb.z * nz;
+        const float vbt_x = vb.x - vb_n * nx;
+        const float vbt_y = vb.y - vb_n * ny;
+        const float vbt_z = vb.z - vb_n * nz;
+
+        const float depth_fric = fmaxf(depth, 0.1f * thickness);
+        const float f_n = stiffness * depth_fric;
+        const math::Vec4f slip = slips[p];
+        const float u_norm = slip.w;
+        const float f1 = f1_sf_over_x(u_norm, friction_epsilon);
+        const float alpha = friction_mu * f_n * f1;
+
+        // Scale factor: 0 when slip=0 (no force was injected), 1 when
+        // slip >> eps (full body contribution exists in rhs).
+        const float scale = u_norm / fmaxf(u_norm, friction_epsilon);
+
+        f_body_x = scale * alpha * vbt_x * dt;
+        f_body_y = scale * alpha * vbt_y * dt;
+        f_body_z = scale * alpha * vbt_z * dt;
+    }
+
     const float fn_push = stiffness * depth;
     const math::Vec3f r = rhs[p];
-    const math::Vec3f F0(r.x - fn_push * nx,
-                         r.y - fn_push * ny,
-                         r.z - fn_push * nz);
+    const math::Vec3f F0(r.x - fn_push * nx - f_body_x,
+                         r.y - fn_push * ny - f_body_y,
+                         r.z - fn_push * nz - f_body_z);
 
     const float F0_n_scalar = F0.x * nx + F0.y * ny + F0.z * nz;
-    const float f_n_mag     = fmaxf(0.0f, -F0_n_scalar);
-    if (f_n_mag <= 0.0f) return;
+
+    const float depth_for_cone = fmaxf(depth, 0.1f * thickness);
+    const float cone = friction_mu * stiffness * depth_for_cone;
 
     const math::Vec3f F0_t(F0.x - F0_n_scalar * nx,
                            F0.y - F0_n_scalar * ny,
@@ -261,37 +336,59 @@ __global__ void apply_coulomb_friction_kernel(
     if (F_T_sq <= 0.0f) return;
     const float F_T = sqrtf(F_T_sq);
 
-    const float cone = friction_mu * f_n_mag;
-    // if (F_T > cone) {
-    //     // SLIDING branch: cap the tangential force at the cone radius.
-    //     // The IPC implicit friction baked in `scatter_gradient` /
-    //     // `bake_diag` already drives sticking through an α·(I - nnᵀ)
-    //     // tangential stiffness; capping here brings it back inside the
-    //     // Coulomb cone when it overshoots.
-    //     //
-    //     // We deliberately do NOT zero the tangent in the STICK branch
-    //     // (|F_T| ≤ cone).  Doing so was safe for the static-body
-    //     // `StaticContactSet` (zero tangent == zero tangential
-    //     // acceleration == particle pinned in place), but for an SDF
-    //     // body with non-zero `body_velocity` the cloth is supposed to
-    //     // accelerate tangentially WITH the body — that's the whole
-    //     // point of friction in a moving-jaw scenario.  Zeroing rhs's
-    //     // tangent component would silently kill the IPC friction force
-    //     // that is doing the lifting, so the cloth never follows the
-    //     // jaw upward.  Letting the IPC term flow through unchanged
-    //     // when inside the cone gives the correct moving-body stick.
-    //     const float reduce = 1.0f - cone / F_T;
-    //     rhs[p].x -= reduce * F0_t.x;
-    //     rhs[p].y -= reduce * F0_t.y;
-    //     rhs[p].z -= reduce * F0_t.z;
-    // }
     if (F_T <= cone) {
-        // Legacy STICK branch: remove all tangential force.
-        rhs[p].x -= F0_t.x;
-        rhs[p].y -= F0_t.y;
-        rhs[p].z -= F0_t.z;
+        // STICK: hard-pin the tangential rhs to produce dx_t = v_body·dt.
+        //
+        // The Newton system is  H · dx = rhs,  where
+        //   H_t ≈ M/dt² + alpha   (tangential diagonal from inertia + friction)
+        //
+        // We want  dx_t = v_body_t · dt,  so we need
+        //   rhs_t = H_t · v_body_t · dt
+        //         = (M/dt² + alpha) · v_body_t · dt
+        //         = M · v_body_t / dt  +  alpha · v_body_t · dt
+        //
+        // Also add tangential gravity:  + M · g_t.
+        const math::Vec3f vb = body_velocity_dev[0];
+        const float vb_n = vb.x * nx + vb.y * ny + vb.z * nz;
+        const float vbt_x = vb.x - vb_n * nx;
+        const float vbt_y = vb.y - vb_n * ny;
+        const float vbt_z = vb.z - vb_n * nz;
+
+        const float m = mass[p];
+        const float m_over_dt = m / fmaxf(dt, 1.0e-30f);
+
+        // alpha for friction Hessian (same as bake_diag_kernel uses)
+        const float depth_fric = fmaxf(depth, 0.1f * thickness);
+        const float f_n_fric = stiffness * depth_fric;
+        float alpha_h = 0.0f;
+        if (slips != nullptr) {
+            const float u_norm = slips[p].w;
+            const float f1 = f1_sf_over_x(u_norm, friction_epsilon);
+            alpha_h = friction_mu * f_n_fric * f1;
+        }
+
+        const float gn = gravity.x * nx + gravity.y * ny + gravity.z * nz;
+        const float gt_x = gravity.x - gn * nx;
+        const float gt_y = gravity.y - gn * ny;
+        const float gt_z = gravity.z - gn * nz;
+
+        // target rhs_t = M * v_body_t / dt  +  alpha * v_body_t * dt  +  M * g_t
+        const float target_rhs_t_x = m_over_dt * vbt_x + alpha_h * vbt_x * dt + m * gt_x;
+        const float target_rhs_t_y = m_over_dt * vbt_y + alpha_h * vbt_y * dt + m * gt_y;
+        const float target_rhs_t_z = m_over_dt * vbt_z + alpha_h * vbt_z * dt + m * gt_z;
+
+        // Current tangential rhs
+        const float rhs_n = r.x * nx + r.y * ny + r.z * nz;
+        const float rhs_t_x = r.x - rhs_n * nx;
+        const float rhs_t_y = r.y - rhs_n * ny;
+        const float rhs_t_z = r.z - rhs_n * nz;
+
+        // Replace tangential rhs
+        rhs[p].x += (target_rhs_t_x - rhs_t_x);
+        rhs[p].y += (target_rhs_t_y - rhs_t_y);
+        rhs[p].z += (target_rhs_t_z - rhs_t_z);
     } else {
-        // Legacy SLIDING branch: project onto cone boundary.
+        // SLIDING: project onto cone boundary.
         const float shrink = cone / F_T;
         rhs[p].x -= shrink * F0_t.x;
         rhs[p].y -= shrink * F0_t.y;
@@ -324,6 +421,7 @@ void SdfContact::detect(const math::Vec3f* positions,
         slips_.allocate_device(static_cast<std::size_t>(n_particles));
     }
     cached_has_slip_ = need_slip;
+    cached_dt_ = dt;
 
     SdfVolumeView view = volume_->make_view();
 
@@ -377,6 +475,7 @@ void SdfContact::accumulate_gradient(math::Vec3f*    rhs,
         stiffness_,
         friction_,
         friction_epsilon_,
+        thickness_,
         rhs);
     check_cuda(cudaGetLastError(), "scatter_gradient_kernel launch");
 }
@@ -399,23 +498,39 @@ void SdfContact::bake_diag(math::Mat3f*   diag,
         stiffness_,
         friction_,
         friction_epsilon_,
+        thickness_,
         diag);
     check_cuda(cudaGetLastError(), "bake_diag_kernel launch");
 }
 
-void SdfContact::apply_coulomb_friction(math::Vec3f*    rhs,
-                                        int             n_particles,
-                                        std::uintptr_t  cuda_stream) const {
+void SdfContact::apply_coulomb_friction(math::Vec3f*       rhs,
+                                        int                n_particles,
+                                        const float*       mass,
+                                        const math::Vec3f& gravity,
+                                        float              inv_dt2,
+                                        std::uintptr_t     cuda_stream) const {
     if (!active() || n_particles <= 0) return;
     if (cached_n_particles_ != n_particles) return;
     if (friction_ <= 0.0f) return;
 
+    const math::Vec4f* slip_ptr =
+        (cached_has_slip_) ? slips_.gpu_data() : nullptr;
+
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+    const float3 g3 = make_float3(gravity.x, gravity.y, gravity.z);
     apply_coulomb_friction_kernel<<<grid_for(n_particles), kBlockDim, 0, stream>>>(
         contacts_.gpu_data(),
+        slip_ptr,
         n_particles,
         stiffness_,
         friction_,
+        friction_epsilon_,
+        thickness_,
+        body_velocity_dev_.gpu_data(),
+        mass,
+        g3,
+        inv_dt2,
+        cached_dt_,
         rhs);
     check_cuda(cudaGetLastError(), "apply_coulomb_friction_kernel launch");
 }

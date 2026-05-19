@@ -154,6 +154,9 @@ public:
     // `friction() <= 0` or the particle is not in active contact.
     void apply_coulomb_friction(math::Vec3f*    rhs,
                                 int             n_particles,
+                                const float*    mass,
+                                const math::Vec3f& gravity,
+                                float           inv_dt2,
                                 std::uintptr_t  cuda_stream = 0) const;
 
 private:
@@ -167,8 +170,9 @@ private:
 
     math::Vec3f body_velocity_ = math::Vec3f(0.0f, 0.0f, 0.0f);
 
-    int  cached_n_particles_ = 0;
-    bool cached_has_slip_    = false;
+    int   cached_n_particles_ = 0;
+    bool  cached_has_slip_    = false;
+    float cached_dt_          = 0.0f;
 
     // Per-particle output caches, identical layout to
     // `StaticContactSet::contacts_` / `slips_` so the scatter /

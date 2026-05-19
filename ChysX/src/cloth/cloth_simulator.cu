@@ -860,8 +860,11 @@ void ClothSimulator::step(float dt, std::uintptr_t cuda_stream) {
             if (!contact.active()) continue;
             CHYSX_NVTX_RANGE_COLOUR("step::sdf_contact_friction",
                                     0xff9b59b6);
+            const math::Vec3f gv(g.x, g.y, g.z);
             contact.apply_coulomb_friction(
-                rhs_.gpu_data(), n, cuda_stream);
+                rhs_.gpu_data(), n,
+                mass_.gpu_data(), gv, inv_dt2,
+                cuda_stream);
         }
     }
 
