@@ -227,6 +227,8 @@ class Example:
             self_collision_stiffness=1.0e3,     # matches cloth_drop
             self_collision_friction=0.0,        # was -0.3 (silently
                                                 # disabled but misleading)
+            untangle_enabled=True,
+            untangle_thickness=0.5 * cell,
             self_collision_max_contacts_factor=32,
             self_collision_max_ef_candidates_factor=128,
         )

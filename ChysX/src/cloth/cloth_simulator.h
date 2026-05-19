@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "../collision/mesh_topology.h"
+#include "../collision/mesh_contact.h"
 #include "../collision/sdf/sdf_contact.h"
 #include "../collision/sdf/sdf_volume.h"
 #include "../collision/self_collision.h"
@@ -87,7 +88,8 @@ public:
     void set_external_buffers(std::uintptr_t pos_ptr,
                               std::uintptr_t vel_ptr,
                               int particle_count,
-                              std::uintptr_t inv_mass_ptr = 0) noexcept;
+                              std::uintptr_t inv_mass_ptr = 0,
+                              std::uintptr_t force_ptr = 0) noexcept;
 
     ClothBuffers& buffers() noexcept { return buffers_; }
     const ClothBuffers& buffers() const noexcept { return buffers_; }
@@ -472,6 +474,32 @@ public:
         return *sdf_contacts_[static_cast<std::size_t>(i)];
     }
 
+    // ---- mesh-body contacts (cloth ⇄ animated rigid triangle meshes) --
+    //
+    // BVH-accelerated closest-point contact between cloth particles and
+    // one or more animated rigid triangle meshes.  Functionally
+    // equivalent to SDF-volume contacts but replaces the trilinear SDF
+    // sample with an exact BVH point query — no voxelisation needed.
+    //
+    //     int m0 = sim.add_mesh_body();
+    //     sim.mesh_contact(m0).set_mesh(verts, nv, indices, nt);
+    //     sim.mesh_contact(m0).set_thickness(0.005f);
+    //     // each step:
+    //     sim.mesh_contact(m0).set_pose(pos, ex, ey, ez);
+    //
+    int add_mesh_body();
+
+    int num_mesh_bodies() const noexcept {
+        return static_cast<int>(mesh_contacts_.size());
+    }
+
+    collision::MeshContact& mesh_contact(int i) noexcept {
+        return *mesh_contacts_[static_cast<std::size_t>(i)];
+    }
+    const collision::MeshContact& mesh_contact(int i) const noexcept {
+        return *mesh_contacts_[static_cast<std::size_t>(i)];
+    }
+
     // ---- pin target update (no re-bind) -------------------------------
     //
     // Cheap per-frame update of the pinned particles' target world
@@ -606,6 +634,9 @@ private:
     // pointer the bound `SdfContact` holds).
     std::vector<std::unique_ptr<collision::SdfVolume>>  sdf_volumes_;
     std::vector<std::unique_ptr<collision::SdfContact>> sdf_contacts_;
+    // Mesh bodies: BVH-accelerated closest-point contact per animated
+    // rigid triangle mesh.  Same lifecycle as sdf_volumes_/sdf_contacts_.
+    std::vector<std::unique_ptr<collision::MeshContact>> mesh_contacts_;
 
     // ---- implicit-Euler PCG step working state ----------------------
     //

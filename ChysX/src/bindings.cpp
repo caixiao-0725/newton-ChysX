@@ -64,6 +64,7 @@ pointers in each step via ``set_external_buffers`` before calling
              py::arg("vel_ptr"),
              py::arg("particle_count"),
              py::arg("inv_mass_ptr") = 0,
+             py::arg("force_ptr") = 0,
              R"pbdoc(
 Stash externally-owned CUDA device pointers (cast to int) for the next
 step().  ChysX never copies or frees these; the caller must keep them
@@ -669,6 +670,46 @@ corner_radius : float, optional
     which is often more stable for cloth contact.
 )pbdoc")
         .def(
+            "bake_sdf_from_host",
+            [](chysx::cloth::ClothSimulator& s, int volume_index,
+               py::array_t<float, py::array::c_style | py::array::forcecast> values,
+               int nx, int ny, int nz,
+               float voxel_size,
+               py::array_t<float, py::array::c_style | py::array::forcecast> origin) {
+                if (values.ndim() != 1 ||
+                    values.shape(0) != static_cast<py::ssize_t>(nx) * ny * nz) {
+                    throw std::invalid_argument(
+                        "ClothSimulator.bake_sdf_from_host: values must be a "
+                        "flat (nx*ny*nz,) float32 array in x-major order");
+                }
+                if (origin.ndim() != 1 || origin.shape(0) != 3) {
+                    throw std::invalid_argument(
+                        "ClothSimulator.bake_sdf_from_host: origin must be a "
+                        "(3,) float32 vector");
+                }
+                s.sdf_volume(volume_index).bake_from_host(
+                    values.data(),
+                    nx, ny, nz,
+                    voxel_size,
+                    chysx::math::Vec3f(origin.at(0), origin.at(1), origin.at(2)));
+            },
+            py::arg("volume_index"),
+            py::arg("values"),
+            py::arg("nx"),
+            py::arg("ny"),
+            py::arg("nz"),
+            py::arg("voxel_size"),
+            py::arg("origin"),
+            R"pbdoc(
+Bake a precomputed SDF grid into volume ``volume_index``.
+
+``values`` is a flat ``(nx*ny*nz,)`` float32 array in **x-major**
+(x fastest) order holding signed distances.  ``origin`` is the
+world-space position of grid corner ``(0, 0, 0)`` expressed in
+the volume's local frame.  Call once at setup; animate the body
+with ``set_sdf_pose_full(...)`` each frame.
+)pbdoc")
+        .def(
             "set_sdf_pose",
             [](chysx::cloth::ClothSimulator& s, int volume_index,
                py::array_t<float, py::array::c_style | py::array::forcecast> pos) {
@@ -783,6 +824,49 @@ spurious slip (and therefore zero spurious friction).  Default
              },
              py::arg("volume_index"),
              "Currently configured SDF Coulomb friction coefficient.")
+        .def("set_sdf_contact_friction_epsilon",
+             [](chysx::cloth::ClothSimulator& s, int volume_index, float eps) {
+                 s.sdf_contact(volume_index).set_friction_epsilon(eps);
+             },
+             py::arg("volume_index"),
+             py::arg("epsilon"),
+             "Tangential slip regularisation velocity ``ε_u`` [m/s] for the "
+             "IPC smooth Coulomb ramp.  The kernel scales this by ``dt`` to "
+             "get the displacement threshold.")
+        .def("sdf_contact_friction_epsilon",
+             [](const chysx::cloth::ClothSimulator& s, int volume_index) {
+                 return s.sdf_contact(volume_index).friction_epsilon();
+             },
+             py::arg("volume_index"),
+             "Currently configured IPC friction epsilon.")
+        .def("set_sdf_contact_kd",
+             [](chysx::cloth::ClothSimulator& s, int volume_index, float kd) {
+                 s.sdf_contact(volume_index).set_contact_kd(kd);
+             },
+             py::arg("volume_index"),
+             py::arg("kd"),
+             "Contact damping ratio for SDF body ``volume_index``.")
+        .def("sdf_contact_kd",
+             [](const chysx::cloth::ClothSimulator& s, int volume_index) {
+                 return s.sdf_contact(volume_index).contact_kd();
+             },
+             py::arg("volume_index"),
+             "Currently configured contact damping ratio.")
+        .def("set_sdf_ipc_friction_enabled",
+             [](chysx::cloth::ClothSimulator& s, int volume_index, bool v) {
+                 s.sdf_contact(volume_index).set_ipc_friction_enabled(v);
+             },
+             py::arg("volume_index"),
+             py::arg("enabled"),
+             "Enable IPC-style implicit friction for SDF body "
+             "``volume_index``.  When enabled, friction is baked into "
+             "gradient/Hessian (matching VBD) instead of Coulomb post-projection.")
+        .def("sdf_ipc_friction_enabled",
+             [](const chysx::cloth::ClothSimulator& s, int volume_index) {
+                 return s.sdf_contact(volume_index).ipc_friction_enabled();
+             },
+             py::arg("volume_index"),
+             "True if IPC friction is enabled for SDF body ``volume_index``.")
         .def("sdf_volume_active",
              [](const chysx::cloth::ClothSimulator& s, int volume_index) {
                  return s.sdf_volume(volume_index).active();
@@ -797,6 +881,98 @@ spurious slip (and therefore zero spurious friction).  Default
              },
              py::arg("volume_index"),
              "(nx, ny, nz) voxel resolution of the baked SDF.")
+        // ---- mesh-body contacts (BVH-accelerated triangle mesh) --------
+        .def("add_mesh_body",
+             [](chysx::cloth::ClothSimulator& s) { return s.add_mesh_body(); },
+             "Allocate a new mesh-body contact slot and return its index.")
+        .def("num_mesh_bodies",
+             &chysx::cloth::ClothSimulator::num_mesh_bodies,
+             "Number of mesh bodies currently held.")
+        .def(
+            "set_mesh_body_mesh",
+            [](chysx::cloth::ClothSimulator& s, int idx,
+               py::array_t<float, py::array::c_style | py::array::forcecast> verts,
+               py::array_t<int, py::array::c_style | py::array::forcecast> indices) {
+                if (verts.ndim() != 2 || verts.shape(1) != 3)
+                    throw std::invalid_argument("verts must be (N, 3) float32");
+                if (indices.ndim() != 1 || (indices.shape(0) % 3) != 0)
+                    throw std::invalid_argument("indices must be flat with length divisible by 3");
+                int nv = static_cast<int>(verts.shape(0));
+                int nt = static_cast<int>(indices.shape(0)) / 3;
+                s.mesh_contact(idx).set_mesh(
+                    reinterpret_cast<const chysx::math::Vec3f*>(verts.data()),
+                    nv, indices.data(), nt);
+            },
+            py::arg("mesh_body_index"),
+            py::arg("vertices"),
+            py::arg("indices"),
+            "Upload a triangle mesh (rest pose) for mesh body ``mesh_body_index``.")
+        .def(
+            "set_mesh_body_pose",
+            [](chysx::cloth::ClothSimulator& s, int idx,
+               py::array_t<float, py::array::c_style | py::array::forcecast> pos,
+               py::array_t<float, py::array::c_style | py::array::forcecast> ex,
+               py::array_t<float, py::array::c_style | py::array::forcecast> ey,
+               py::array_t<float, py::array::c_style | py::array::forcecast> ez) {
+                auto v3 = [](auto& a, const char* name) {
+                    if (a.ndim() != 1 || a.shape(0) != 3)
+                        throw std::invalid_argument(
+                            std::string("set_mesh_body_pose: ") + name +
+                            " must be (3,) float32");
+                    return chysx::math::Vec3f(a.at(0), a.at(1), a.at(2));
+                };
+                s.mesh_contact(idx).set_pose(
+                    v3(pos, "pos"), v3(ex, "ex"), v3(ey, "ey"), v3(ez, "ez"));
+            },
+            py::arg("mesh_body_index"),
+            py::arg("pos"), py::arg("ex"), py::arg("ey"), py::arg("ez"),
+            "Set mesh body's world pose (pos + rotation columns).")
+        .def("set_mesh_body_velocity",
+             [](chysx::cloth::ClothSimulator& s, int idx,
+                py::array_t<float, py::array::c_style | py::array::forcecast> v) {
+                 if (v.ndim() != 1 || v.shape(0) != 3)
+                     throw std::invalid_argument("v must be (3,) float32");
+                 s.mesh_contact(idx).set_body_velocity(
+                     chysx::math::Vec3f(v.at(0), v.at(1), v.at(2)));
+             },
+             py::arg("mesh_body_index"), py::arg("v"),
+             "Set mesh body's linear velocity [m/s].")
+        .def("set_mesh_body_thickness",
+             [](chysx::cloth::ClothSimulator& s, int idx, float t) {
+                 s.mesh_contact(idx).set_thickness(t);
+             },
+             py::arg("mesh_body_index"), py::arg("thickness"))
+        .def("set_mesh_body_stiffness",
+             [](chysx::cloth::ClothSimulator& s, int idx, float k) {
+                 s.mesh_contact(idx).set_stiffness(k);
+             },
+             py::arg("mesh_body_index"), py::arg("stiffness"))
+        .def("set_mesh_body_friction",
+             [](chysx::cloth::ClothSimulator& s, int idx, float mu) {
+                 s.mesh_contact(idx).set_friction(mu);
+             },
+             py::arg("mesh_body_index"), py::arg("friction"))
+        .def("set_mesh_body_ipc_friction",
+             [](chysx::cloth::ClothSimulator& s, int idx, bool v) {
+                 s.mesh_contact(idx).set_ipc_friction_enabled(v);
+             },
+             py::arg("mesh_body_index"), py::arg("enabled"))
+        .def("set_mesh_body_friction_epsilon",
+             [](chysx::cloth::ClothSimulator& s, int idx, float eps) {
+                 s.mesh_contact(idx).set_friction_epsilon(eps);
+             },
+             py::arg("mesh_body_index"), py::arg("epsilon"))
+        .def("set_mesh_body_contact_kd",
+             [](chysx::cloth::ClothSimulator& s, int idx, float kd) {
+                 s.mesh_contact(idx).set_contact_kd(kd);
+             },
+             py::arg("mesh_body_index"), py::arg("kd"))
+        .def("set_mesh_body_search_radius",
+             [](chysx::cloth::ClothSimulator& s, int idx, float r) {
+                 s.mesh_contact(idx).set_search_radius(r);
+             },
+             py::arg("mesh_body_index"), py::arg("radius"),
+             "BVH query radius for deep penetration recovery. 0 = 10*thickness.")
         .def_property_readonly(
             "material",
             [](chysx::cloth::ClothSimulator& s) -> chysx::cloth::ClothMaterial& {

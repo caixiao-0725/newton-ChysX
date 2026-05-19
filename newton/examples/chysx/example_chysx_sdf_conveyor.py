@@ -124,7 +124,10 @@ class Example:
             bending_stiffness=1.0e-4,
             pcg_iterations=50,
             surface_density=0.3,
-            self_collision_enabled=False,
+            self_collision_enabled=True,
+            self_collision_thickness=0.2 * cell,
+            untangle_enabled=True,
+            untangle_thickness=0.5 * cell,
             static_contact_enabled=False,
         )
 

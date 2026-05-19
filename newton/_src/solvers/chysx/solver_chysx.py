@@ -647,6 +647,9 @@ class SolverChysX(SolverBase):
         thickness: float = 0.0,
         stiffness: float = 1.0e4,
         friction: float = 0.0,
+        friction_epsilon: float = 0.01,
+        contact_kd: float = 1.0e-2,
+        ipc_friction: bool = False,
     ) -> int:
         """Bake an analytic axis-aligned box SDF into one of the
         simulator's owned ``SdfVolume`` slots and configure the
@@ -690,6 +693,17 @@ class SolverChysX(SolverBase):
             Per-contact penalty stiffness ``k`` [N/m].
         ``friction``
             Coulomb friction coefficient ``μ`` (dimensionless).
+        ``friction_epsilon``
+            IPC friction regularisation velocity ``ε_u`` [m/s].
+            Internally multiplied by ``dt`` to get the displacement
+            threshold for the ``f1_SF_over_x`` smooth ramp.
+        ``contact_kd``
+            Contact damping ratio (dimensionless).  Only active when
+            ``ipc_friction=True``.
+        ``ipc_friction``
+            When ``True``, friction is baked implicitly into the
+            gradient and Hessian (VBD/IPC style) instead of being
+            applied as a Coulomb-cone post-projection.
 
         Returns
         -------
@@ -747,7 +761,43 @@ class SolverChysX(SolverBase):
         self._sim.set_sdf_contact_thickness(int(volume_index), float(thickness))
         self._sim.set_sdf_contact_stiffness(int(volume_index), float(stiffness))
         self._sim.set_sdf_contact_friction(int(volume_index), float(friction))
+        self._sim.set_sdf_contact_friction_epsilon(
+            int(volume_index), float(friction_epsilon))
+        self._sim.set_sdf_contact_kd(int(volume_index), float(contact_kd))
+        self._sim.set_sdf_ipc_friction_enabled(
+            int(volume_index), bool(ipc_friction))
         return int(volume_index)
+
+    def bake_sdf_from_host(
+        self,
+        volume_index: int,
+        values: np.ndarray,
+        nx: int,
+        ny: int,
+        nz: int,
+        voxel_size: float,
+        origin: tuple[float, float, float] | np.ndarray,
+    ) -> None:
+        """Bake a precomputed SDF grid into volume ``volume_index``.
+
+        Args:
+            volume_index: Index returned by :meth:`bake_sdf_box` or a
+                prior ``add_sdf_volume()`` call.
+            values: Flat ``(nx*ny*nz,)`` float32 array of signed
+                distances in x-major order.
+            nx: Grid resolution along X.
+            ny: Grid resolution along Y.
+            nz: Grid resolution along Z.
+            voxel_size: Edge length of cubic voxels [m].
+            origin: Local-frame position of grid corner ``(0,0,0)`` [m].
+        """
+        values_np = np.ascontiguousarray(values, dtype=np.float32).ravel()
+        origin_np = np.ascontiguousarray(origin, dtype=np.float32).reshape(3)
+        self._sim.bake_sdf_from_host(
+            int(volume_index), values_np,
+            int(nx), int(ny), int(nz),
+            float(voxel_size), origin_np,
+        )
 
     def set_sdf_pose(
         self,
@@ -759,6 +809,26 @@ class SolverChysX(SolverBase):
         body."""
         pos_np = np.ascontiguousarray(pos, dtype=np.float32).reshape(3)
         self._sim.set_sdf_pose(int(volume_index), pos_np)
+
+    def set_sdf_pose_full(
+        self,
+        volume_index: int,
+        pos: np.ndarray,
+        rot: np.ndarray,
+    ) -> None:
+        """Update SDF body ``volume_index``'s full world pose.
+
+        Args:
+            pos: World-space position ``(3,)`` [m].
+            rot: ``(3, 3)`` rotation matrix whose columns are the
+                local +x/+y/+z axes in world space.
+        """
+        pos_np = np.ascontiguousarray(pos, dtype=np.float32).reshape(3)
+        rot_np = np.ascontiguousarray(rot, dtype=np.float32).reshape(3, 3)
+        ex = np.ascontiguousarray(rot_np[:, 0])
+        ey = np.ascontiguousarray(rot_np[:, 1])
+        ez = np.ascontiguousarray(rot_np[:, 2])
+        self._sim.set_sdf_pose_full(int(volume_index), pos_np, ex, ey, ez)
 
     def set_sdf_body_velocity(
         self,
@@ -775,6 +845,80 @@ class SolverChysX(SolverBase):
         """
         v_np = np.ascontiguousarray(v, dtype=np.float32).reshape(3)
         self._sim.set_sdf_body_velocity(int(volume_index), v_np)
+
+    # ---- mesh-body contacts (cloth ⇄ animated rigid meshes) -----------
+
+    def add_mesh_body(
+        self,
+        vertices: np.ndarray,
+        indices: np.ndarray,
+        thickness: float = 0.005,
+        stiffness: float = 1.0e4,
+        friction: float = 0.0,
+        friction_epsilon: float = 0.01,
+        contact_kd: float = 1.0e-2,
+        ipc_friction: bool = True,
+        search_radius: float = 0.0,
+    ) -> int:
+        """Register a rigid triangle mesh for BVH-accelerated contact.
+
+        Call once per rigid body at setup. Returns the ``mesh_body_index``
+        used by :meth:`set_mesh_body_pose` etc.
+
+        Args:
+            vertices: Rest-pose vertices ``(N, 3)`` float32 [m].
+            indices: Flat triangle indices ``(3*T,)`` int32.
+            thickness: Contact distance threshold [m].
+            stiffness: Penalty stiffness [N/m].
+            friction: Coulomb friction coefficient (dimensionless).
+            friction_epsilon: IPC friction smoothing velocity [m/s].
+            contact_kd: Contact damping ratio.
+            ipc_friction: Use IPC implicit friction (True) or
+                post-projection (False).
+            search_radius: BVH query radius [m]. 0 uses ``10 * thickness``
+                to recover deeply penetrated particles.
+        """
+        idx = int(self._sim.add_mesh_body())
+        verts_np = np.ascontiguousarray(vertices, dtype=np.float32).reshape(-1, 3)
+        idx_np = np.ascontiguousarray(indices, dtype=np.int32).ravel()
+        self._sim.set_mesh_body_mesh(idx, verts_np, idx_np)
+        self._sim.set_mesh_body_thickness(idx, float(thickness))
+        self._sim.set_mesh_body_stiffness(idx, float(stiffness))
+        self._sim.set_mesh_body_friction(idx, float(friction))
+        self._sim.set_mesh_body_friction_epsilon(idx, float(friction_epsilon))
+        self._sim.set_mesh_body_contact_kd(idx, float(contact_kd))
+        self._sim.set_mesh_body_ipc_friction(idx, bool(ipc_friction))
+        self._sim.set_mesh_body_search_radius(idx, float(search_radius))
+        return idx
+
+    def set_mesh_body_pose(
+        self,
+        mesh_body_index: int,
+        pos: np.ndarray,
+        rot: np.ndarray,
+    ) -> None:
+        """Update a mesh body's world pose (call every frame).
+
+        Args:
+            mesh_body_index: Index returned by :meth:`add_mesh_body`.
+            pos: World-space position ``(3,)`` [m].
+            rot: ``(3, 3)`` rotation matrix (columns = local axes).
+        """
+        pos_np = np.ascontiguousarray(pos, dtype=np.float32).reshape(3)
+        rot_np = np.ascontiguousarray(rot, dtype=np.float32).reshape(3, 3)
+        ex = np.ascontiguousarray(rot_np[:, 0])
+        ey = np.ascontiguousarray(rot_np[:, 1])
+        ez = np.ascontiguousarray(rot_np[:, 2])
+        self._sim.set_mesh_body_pose(int(mesh_body_index), pos_np, ex, ey, ez)
+
+    def set_mesh_body_velocity(
+        self,
+        mesh_body_index: int,
+        v: tuple[float, float, float] | np.ndarray,
+    ) -> None:
+        """Set a mesh body's linear velocity [m/s]."""
+        v_np = np.ascontiguousarray(v, dtype=np.float32).reshape(3)
+        self._sim.set_mesh_body_velocity(int(mesh_body_index), v_np)
 
     # ---- pin animation ------------------------------------------------
 

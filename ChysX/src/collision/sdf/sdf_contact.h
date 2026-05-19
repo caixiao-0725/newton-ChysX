@@ -88,6 +88,18 @@ public:
     void set_friction(float mu) noexcept { friction_ = mu; }
     float friction() const noexcept { return friction_; }
 
+    void set_friction_epsilon(float eps) noexcept { friction_epsilon_ = eps; }
+    float friction_epsilon() const noexcept { return friction_epsilon_; }
+
+    void set_contact_kd(float kd) noexcept { contact_kd_ = kd; }
+    float contact_kd() const noexcept { return contact_kd_; }
+
+    /// When true, friction is baked implicitly into gradient/Hessian
+    /// (IPC style, matching VBD).  When false (default), friction is
+    /// applied as a Coulomb-cone post-projection on the assembled rhs.
+    void set_ipc_friction_enabled(bool v) noexcept { ipc_friction_ = v; }
+    bool ipc_friction_enabled() const noexcept { return ipc_friction_; }
+
     // SDF body's linear velocity in world frame [m/s].  Subtracted
     // from each particle's velocity before projecting onto the
     // contact tangent so friction sees the correct *relative* slip
@@ -123,23 +135,29 @@ public:
                 const math::Vec3f* velocities  = nullptr,
                 float              dt          = 0.0f);
 
-    // rhs[p] += -k * depth_p * n_p  (penalty only, no friction).
+    // Penalty gradient (+ optional IPC friction).
     //
-    // Must be called on the same `n_particles` that was last passed
-    // to `detect()`; otherwise this is a silent no-op (defensive).
+    // When `ipc_friction_enabled()`, injects both penalty AND friction
+    // forces using the VBD-style IPC model (relative_translation based).
+    // `prev_positions` is the x_n array cached by ClothSimulator.
+    //
+    // When `!ipc_friction_enabled()`, injects penalty only; friction
+    // is handled by `apply_coulomb_friction` as a post-projection.
     void accumulate_gradient(math::Vec3f*    rhs,
                              int             n_particles,
-                             std::uintptr_t  cuda_stream = 0) const;
+                             std::uintptr_t  cuda_stream = 0,
+                             const math::Vec3f* positions = nullptr,
+                             const math::Vec3f* prev_positions = nullptr,
+                             float           dt = 0.0f) const;
 
-    // A.diag[p] += k * (n n^T)   (penalty only, no friction stiffness).
-    //
-    // `dt` is unused (kept as an argument so the caller in
-    // `ClothSimulator` doesn't need a separate code path from
-    // `static_contact.bake_diag`).
+    // Penalty Hessian diagonal (+ optional IPC friction Hessian).
+    // Same IPC/Coulomb routing as `accumulate_gradient`.
     void bake_diag(math::Mat3f*    A_diag,
                    int             n_particles,
                    float           dt,
-                   std::uintptr_t  cuda_stream = 0) const;
+                   std::uintptr_t  cuda_stream = 0,
+                   const math::Vec3f* positions = nullptr,
+                   const math::Vec3f* prev_positions = nullptr) const;
 
     // Coulomb-cone post-projection of the assembled Newton residual.
     // STICK: hard-pin rhs_t so dx_t = v_body_t * dt.
@@ -148,9 +166,19 @@ public:
     void apply_coulomb_friction(math::Vec3f*    rhs,
                                 int             n_particles,
                                 const float*    mass,
+                                const math::Mat3f* diag,
                                 const math::Vec3f& gravity,
                                 float           inv_dt2,
                                 std::uintptr_t  cuda_stream = 0) const;
+
+    /// Inject tangential penalty for STICK particles into diag and rhs
+    /// so PCG drives dx_t toward v_body_t * dt.  Must be called AFTER
+    /// bake_diag (which bakes penalty nn^T) and AFTER apply_coulomb_friction.
+    void bake_stick_constraint(math::Vec3f*    rhs,
+                               math::Mat3f*    diag,
+                               int             n_particles,
+                               const float*    mass,
+                               std::uintptr_t  cuda_stream = 0) const;
 
 private:
     // Non-owning pointer (the volume's storage outlives us).
@@ -159,11 +187,15 @@ private:
     float thickness_        = 0.0f;
     float stiffness_        = 0.0f;
     float friction_         = 0.0f;
+    float friction_epsilon_  = 0.01f;
+    float contact_kd_       = 1.0e-2f;
+    bool  ipc_friction_     = false;
 
     math::Vec3f body_velocity_ = math::Vec3f(0.0f, 0.0f, 0.0f);
 
-    int   cached_n_particles_ = 0;
-    float cached_dt_          = 0.0f;
+    int          cached_n_particles_ = 0;
+    float        cached_dt_          = 0.0f;
+    const math::Vec3f* cached_velocities_ = nullptr;
 
     // Per-particle (normal, depth) cache.
     CudaArray<math::Vec4f> contacts_;
