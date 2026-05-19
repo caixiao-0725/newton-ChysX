@@ -103,6 +103,115 @@ active SDF contacts: 0
 
 ---
 
+## 陷阱 4：CUDA Graph capture 会冻结 by-value kernel 参数
+
+### 现象
+
+`bake_sdf_box` + `set_sdf_pose(volume_index, pos)` 看上去工作正常——
+host 侧每帧把新的 pose 推下去，可视化里 box 也跟着动。但布料**完全
+感受不到 box 的运动**：在 `example_chysx_sdf_gripper` 里，夹爪闭合
+后向上抬升 25 cm，布料原地不动；切换到不走 graph 的 path（手动
+`_simulate_substeps()`）布料立刻开始跟随。
+
+### 真正机制
+
+`SdfContact::detect()` 这样启动 detect kernel：
+
+```cpp
+SdfVolumeView view = volume_->make_view();   // host 侧 POD
+detect_kernel<<<...>>>(..., view, body_velocity, ...);
+```
+
+其中 `view` 包含 `pos_, ex_, ey_, ez_`，`body_velocity` 是 `float3`。
+两者都是**按值**传给 kernel。
+
+CUDA Graph capture 录制 kernel launch 节点时，会把 kernel 参数
+**复制一份**到 graph 节点里。Replay 同一个 graph 时这些参数永远是
+capture 时刻的值——后续 host 上更新的 `pos`、`body_velocity` 全
+被旁路。结果就是 graph 里的 detect kernel 永远在用"开始 lift 前
+那一帧"的 pose 算 contact，布料看到的 SDF body 像被钉死了。
+
+### 修复
+
+把 pose / body_velocity 从 host-by-value 改成 device-pointer：
+
+- `SdfVolume` 内部加 `CudaArray<Vec3f> pose_dev_`（4 个 Vec3f：
+  `[pos, ex, ey, ez]`），`set_pose(...)` 写 host cache + async H2D
+  copy 进这个稳定的 device buffer。
+- `SdfVolumeView::pose` 变成 `const Vec3f*` 指针。Graph capture 时
+  pointer 值固定（device buffer 不会被 resize），replay 时 kernel
+  读 pointer 指向的最新数据。
+- `SdfContact` 同理给 `body_velocity_` 加一个 1-元素 device buffer。
+
+device buffer 必须**lazy-alloc 一次后永不重新分配**，否则 graph
+里那份 pointer 会失效。`set_pose` 路径里加 `if (gpu_size() != N)`
+guard，保证只在第一次调用时 resize。
+
+### 经验
+
+只要某个 host-mutable 状态会被 CUDA Graph 内的 kernel 读取，就**不能**
+按值传——必须挪到 device buffer 经指针访问。这条规则适用于所有
+"每帧改一点 host 标量然后跑 graph"的场景：动画 pose、shader uniform、
+材质参数等等都需要这样处理。
+
+---
+
+## 陷阱 5：IPC lagged 摩擦的 RHS 符号在 body 移动时反了
+
+### 现象
+
+修完陷阱 4 后，`example_chysx_sdf_gripper` 里夹爪向上 lift，布料
+**反方向掉下去**（cloth 离 jaw 越来越远，从 -20mm 掉到 -30mm）。
+直觉上摩擦应该把布料往 jaw 方向拽，但实际给出的力是相反的。
+
+### 真正机制
+
+`scatter_gradient_kernel` 原本写：
+
+```cpp
+const Vec3f slip = (v_particle - v_body) * dt;   // 切向投影后
+rhs[p] += -alpha * slip;                          // 加到 grad E
+```
+
+接着 `assemble_rhs_kernel` 把累积的 `grad E` **变号**折进 Newton
+残差：`rhs_final = M·v_n/dt + M·g - rhs_grad`，所以最终 rhs 里
+摩擦项贡献是 `+α · slip = +α · (v_particle - v_body) · dt`。
+
+当布料静止、body 向上 lift 时：
+- `v_particle.z = 0`
+- `v_body.z = +0.05`
+- `slip.z = -0.05 · dt` (负)
+- `rhs_final.z += +α · slip.z = -α · dt · v_body` (负 = 把布料拉下去!)
+
+正确的 IPC lagged-Newton 推导是：摩擦力 `f_t = -α (dx - dt · v_body)_t`
+在 RHS 上的贡献是 `+α · dt · v_body_t`（独立于 `v_particle`，永远
+把布料朝 body 切向位置牵）。所以 `slip` 在 RHS 用法上的符号刚好反
+了，原写法只能在 `v_body = 0` 的静态体场景下"看起来对"（因为静态
+体 Coulomb cone post-projection 会把 stick 分支的切向直接清零，把
+错误符号掩盖掉）。
+
+### 修复
+
+`sdf_contact.cu` 的 `scatter_gradient_kernel` 改成 `+alpha * slip`
+（即不再取反）。同时 `apply_coulomb_friction_kernel` 删掉 stick
+分支的"把切向清零"逻辑，只保留 slip 分支的 cone-cap——否则即使
+RHS 符号修对了，post-projection 还是会把 IPC 摩擦贡献再次清零。
+
+`static_contact.cu` 保持不变：它的用例都是静态体 (`v_body ≡ 0`)，
+新旧符号给出相同结果（`slip = v_particle · dt`，stick 分支由 cone
+projection 接管）。两条 contact 通道符号约定从此**有意不同**，这是
+"分别针对自己使用场景做最简实现"的取舍。
+
+### 经验
+
+IPC lagged-Newton 摩擦在静态 body 场景下，RHS 符号错了照样能工作
+（cone post-projection 兜底），所以这条 bug 在没有移动 body 的 unit
+test 里**测不出来**。要 catch 这类问题，回归测试必须覆盖"body 主动
+移动、布料应当随动"的场景（比如 `example_chysx_sdf_gripper` 里夹爪
+带布料抬升的 `test_final`）。
+
+---
+
 ## 陷阱 3：IPC lagged 摩擦在准静态 SDF 接触上会自激
 
 IPC 摩擦（Li et al. 2020）在 ChysX 里是 lagged-Newton 线性化：
@@ -132,11 +241,13 @@ IPC 摩擦（Li et al. 2020）在 ChysX 里是 lagged-Newton 线性化：
 ### `SdfVolume` 数据 vs pose 解耦
 
 `bake_box` 只写 `values_, nx_, ny_, nz_, voxel_size_, origin_local_`
-（静态烘焙数据）；body 的 world pose `pos_, ex_, ey_, ez_` 是独立成员，
-每帧通过 `set_pose(...)` 改。`make_view()` 把两者打包成 POD 传给 kernel。
+（静态烘焙数据）；body 的 world pose `(pos, ex, ey, ez)` 缓存在
+**device buffer** `pose_dev_`（见陷阱 4），每帧 `set_pose(...)` async
+H2D copy 进去。`make_view()` 给 kernel 的是 device pointer，graph
+capture 时 pointer 稳定，replay 自动读到最新 pose。
 
-好处：移动 body 不重烘焙、可被 CUDA Graph 捕获重放（pose 在 host 改，view
-在 kernel 入口按值读，不破坏 graph 拓扑）。
+好处：移动 body 不重烘焙、CUDA Graph 跨帧重放也能拿到最新 pose、
+所有 SDF kernel launch 都是 graph-friendly 的。
 
 ### 为什么 SDF 法向要重新归一化
 

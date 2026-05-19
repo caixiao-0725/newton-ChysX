@@ -40,6 +40,9 @@ struct ClothBuffers {
     // Per-particle inverse masses [1/kg].  Optional; the free-fall
     // path leaves it empty.
     DeviceSpan<float> inv_mass;
+    // Per-particle external forces [N].  Optional; when non-empty
+    // the force is folded into x_tilde as  dt^2 * f_ext[i] / m[i].
+    DeviceSpan<math::Vec3f> ext_force;
 
     int particle_count() const noexcept {
         return static_cast<int>(pos.size());
@@ -62,6 +65,7 @@ struct ClothBuffers {
         pos.reset();
         vel.reset();
         inv_mass.reset();
+        ext_force.reset();
     }
 };
 

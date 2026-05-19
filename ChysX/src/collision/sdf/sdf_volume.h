@@ -29,11 +29,13 @@
 // Construction
 // ------------
 //
-//   * `bake_box(hx, hy, hz, voxel_size, padding)` -- bakes the
+//   * `bake_box(hx, hy, hz, voxel_size, padding, corner_radius)` -- bakes the
 //     analytic box SDF into a grid sized to cover `(±hx±pad,
 //     ±hy±pad, ±hz±pad)` with cubic voxels.  Padding defaults to
 //     `2 · voxel_size` (just enough to give the penalty band a clean
-//     gradient on the surface).
+//     gradient on the surface).  `corner_radius > 0` turns it into a
+//     rounded box (Minkowski sum with a sphere), which smooths the
+//     normal field near sharp edges / corners.
 //
 //   * `bake_from_host(values_xyz, nx, ny, nz, voxel_size, origin_local)`
 //     -- generic upload from a precomputed host array.  Useful for
@@ -79,8 +81,11 @@ public:
     // cubic voxels.  `padding` controls how much extra room the grid
     // wraps around the box (so the SDF is monotonic past the surface);
     // when negative (the default `-1`), defaults to `2 * voxel_size`.
+    // `corner_radius` controls optional edge rounding: 0 = sharp box.
+    // Must satisfy 0 <= corner_radius < min(hx, hy, hz).
     void bake_box(float hx, float hy, float hz, float voxel_size,
-                  float padding = -1.0f);
+                  float padding = -1.0f,
+                  float corner_radius = 0.0f);
 
     // Generic host->device upload.  `values_xyz` is a flat row-major
     // array of length `nx * ny * nz`, indexed as
@@ -99,22 +104,27 @@ public:
     // vectors `(ex, ey, ez)` (i.e. `ex` is the local +x axis expressed
     // in world coordinates).  The three vectors must be orthonormal;
     // we do not re-orthogonalise on the device.
+    //
+    // The pose lives in a small device buffer (4 × Vec3f) so the
+    // value the sampling kernel reads stays in sync even when the
+    // kernel launch is part of a captured CUDA Graph (graph capture
+    // freezes by-value kernel arguments, so we'd otherwise be stuck
+    // forever with the pose the volume had at capture time).  Each
+    // call uploads 48 bytes async on the optional `cuda_stream`.
     void set_pose(const math::Vec3f& pos,
                   const math::Vec3f& ex,
                   const math::Vec3f& ey,
-                  const math::Vec3f& ez) noexcept {
-        pos_ = pos;
-        ex_  = ex;
-        ey_  = ey;
-        ez_  = ez;
-    }
+                  const math::Vec3f& ez,
+                  std::uintptr_t cuda_stream = 0) noexcept;
 
     // Convenience for axis-aligned bodies (identity rotation).
-    void set_pose_translation(const math::Vec3f& pos) noexcept {
+    void set_pose_translation(const math::Vec3f& pos,
+                              std::uintptr_t cuda_stream = 0) noexcept {
         set_pose(pos,
                  math::Vec3f(1.0f, 0.0f, 0.0f),
                  math::Vec3f(0.0f, 1.0f, 0.0f),
-                 math::Vec3f(0.0f, 0.0f, 1.0f));
+                 math::Vec3f(0.0f, 0.0f, 1.0f),
+                 cuda_stream);
     }
 
     // ---- accessors --------------------------------------------------
@@ -147,16 +157,33 @@ public:
     SdfVolumeView make_view() const noexcept;
 
 private:
+    // Lazily allocate the 4-Vec3f device pose buffer the first time
+    // we need it.  Mutable so we can do it from const `make_view()`
+    // — but the function semantics stay const-correct (no observable
+    // state change for callers, the buffer is just an opaque scratch
+    // area used only by `set_pose`).
+    void ensure_pose_buffer_() const;
+
     int                nx_ = 0;
     int                ny_ = 0;
     int                nz_ = 0;
     float              voxel_size_ = 0.0f;
     math::Vec3f        origin_local_;
+    // Host-side cache of the latest (pos, ex, ey, ez) so accessors
+    // stay cheap and `make_view()` can rebuild without bouncing
+    // through device memory.
     math::Vec3f        pos_;
     math::Vec3f        ex_ = math::Vec3f(1.0f, 0.0f, 0.0f);
     math::Vec3f        ey_ = math::Vec3f(0.0f, 1.0f, 0.0f);
     math::Vec3f        ez_ = math::Vec3f(0.0f, 0.0f, 1.0f);
     CudaArray<float>   values_;
+    // Device-side mirror of (pos, ex, ey, ez), 4 contiguous Vec3f's,
+    // consumed by `SdfVolumeView`'s sample kernel.  We keep this
+    // on-device buffer stable across set_pose calls so the device
+    // pointer the view holds stays valid for the lifetime of the
+    // volume — required for CUDA Graph capture / replay of the
+    // SDF detector kernels.
+    mutable CudaArray<math::Vec3f> pose_dev_;
 };
 
 }  // namespace collision

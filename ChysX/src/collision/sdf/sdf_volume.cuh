@@ -12,20 +12,21 @@
 namespace chysx {
 namespace collision {
 
-// Read-only POD bundle the kernels take by value.  All members are
-// trivially-copyable, total size is ~80 bytes (fits in registers /
-// constant cache after one load).
+// Read-only POD bundle the kernels take by value.  Pose lives in a
+// SEPARATE device buffer (`pose` points at four contiguous Vec3f's:
+// [pos, ex, ey, ez]) so the kernel reads whatever was last uploaded
+// by `SdfVolume::set_pose(...)` — even after the kernel launch has
+// been captured into a CUDA Graph.  Embedding the pose by value here
+// would let `cudaGraphInstantiate` snapshot it at capture time, and
+// any later `set_pose` would silently have no effect during replay.
 struct SdfVolumeView {
-    int          nx;
-    int          ny;
-    int          nz;
-    float        voxel_size;
-    math::Vec3f  origin_local;
-    math::Vec3f  pos;
-    math::Vec3f  ex;
-    math::Vec3f  ey;
-    math::Vec3f  ez;
-    const float* values;  // length nx*ny*nz, x fastest
+    int                nx;
+    int                ny;
+    int                nz;
+    float              voxel_size;
+    math::Vec3f        origin_local;
+    const math::Vec3f* pose;    // [pos, ex, ey, ez], 4 Vec3f's on device
+    const float*       values;  // length nx*ny*nz, x fastest
 
     // Trilinear-sample the SDF at a world-space point.  Returns
     //   out_sd          : signed distance at `world_point` (positive
@@ -41,6 +42,14 @@ struct SdfVolumeView {
     __device__ inline void sample(const math::Vec3f& world_point,
                                   float&             out_sd,
                                   math::Vec3f&       out_world_grad) const {
+        // Read the latest pose from device memory.  pose[0] = body
+        // origin in world; pose[1..3] = the orthonormal columns of
+        // the world<-local rotation.
+        const math::Vec3f pos = pose[0];
+        const math::Vec3f ex  = pose[1];
+        const math::Vec3f ey  = pose[2];
+        const math::Vec3f ez  = pose[3];
+
         // ---- world -> local ----------------------------------------
         // R has columns (ex, ey, ez); R^T row k is the k-th column of
         // R (= ex/ey/ez).  Therefore

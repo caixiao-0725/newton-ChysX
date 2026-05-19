@@ -76,20 +76,33 @@ __global__ void mass_from_inv_mass_kernel(const float* __restrict__ inv_mass,
     mass[i] = (w > 1.0e-12f) ? (1.0f / w) : 1.0e8f;
 }
 
-// Inertial predictor: x_tilde = x_n + dt * v_n + dt^2 * g.
+// Inertial predictor:
+//   x_tilde = x_n + dt * v_n + dt^2 * (g + f_ext[i] / m[i])
+// When ext_force is nullptr or mass is nullptr, the force term is
+// skipped and this reduces to the original  x_n + dt*v + dt^2*g.
 __global__ void compute_x_tilde_kernel(const float3* __restrict__ pos,
                                        const float3* __restrict__ vel,
                                        float3* __restrict__ x_tilde,
                                        int n,
                                        float3 g,
-                                       float dt) {
+                                       float dt,
+                                       const math::Vec3f* __restrict__ ext_force,
+                                       const float* __restrict__ mass) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const float3 p = pos[i];
     const float3 v = vel[i];
-    x_tilde[i] = make_float3(p.x + dt * v.x + dt * dt * g.x,
-                             p.y + dt * v.y + dt * dt * g.y,
-                             p.z + dt * v.z + dt * dt * g.z);
+    float3 accel = g;
+    if (ext_force != nullptr && mass != nullptr) {
+        const float inv_m = (mass[i] > 0.0f) ? (1.0f / mass[i]) : 0.0f;
+        const math::Vec3f f = ext_force[i];
+        accel.x += f.x * inv_m;
+        accel.y += f.y * inv_m;
+        accel.z += f.z * inv_m;
+    }
+    x_tilde[i] = make_float3(p.x + dt * v.x + dt * dt * accel.x,
+                             p.y + dt * v.y + dt * dt * accel.y,
+                             p.z + dt * v.z + dt * dt * accel.z);
 }
 
 // Assemble the full Newton-step RHS in place.
@@ -235,11 +248,30 @@ __global__ void finalize_step_kernel(float3* __restrict__ pos,
 void ClothSimulator::set_external_buffers(std::uintptr_t pos_ptr,
                                           std::uintptr_t vel_ptr,
                                           int particle_count,
-                                          std::uintptr_t inv_mass_ptr) noexcept {
+                                          std::uintptr_t inv_mass_ptr,
+                                          std::uintptr_t force_ptr) noexcept {
     const auto n = static_cast<std::size_t>(particle_count);
     buffers_.pos = DeviceSpan<math::Vec3f>::from_raw(pos_ptr, n);
     buffers_.vel = DeviceSpan<math::Vec3f>::from_raw(vel_ptr, n);
     buffers_.inv_mass = DeviceSpan<float>::from_raw(inv_mass_ptr, n);
+    buffers_.ext_force = DeviceSpan<math::Vec3f>::from_raw(force_ptr, n);
+}
+
+int ClothSimulator::add_mesh_body() {
+    mesh_contacts_.emplace_back(
+        std::make_unique<collision::MeshContact>());
+    return static_cast<int>(mesh_contacts_.size()) - 1;
+}
+
+int ClothSimulator::add_sdf_volume() {
+    // Hold the payload behind unique_ptr so the SdfVolume's address
+    // never moves when the vector grows.  An SdfContact stores a raw
+    // SdfVolume* set at bind time; if the vector were to reallocate
+    // and relocate the SdfVolume payload, that pointer would dangle.
+    sdf_volumes_.emplace_back(std::make_unique<collision::SdfVolume>());
+    sdf_contacts_.emplace_back(std::make_unique<collision::SdfContact>());
+    sdf_contacts_.back()->bind_volume(sdf_volumes_.back().get());
+    return static_cast<int>(sdf_volumes_.size()) - 1;
 }
 
 void ClothSimulator::set_pins(const int* host_indices,
@@ -680,7 +712,7 @@ void ClothSimulator::step(float dt, std::uintptr_t cuda_stream) {
 
         compute_x_tilde_kernel<<<grid, block, 0, stream>>>(
             pos, vel, reinterpret_cast<float3*>(x_tilde_.gpu_data()),
-            n, g, dt);
+            n, g, dt, nullptr, nullptr);
         check_cuda(cudaGetLastError(), "compute_x_tilde kernel launch");
 
         mass_from_inv_mass_kernel<<<grid, block, 0, stream>>>(
@@ -791,23 +823,45 @@ void ClothSimulator::step(float dt, std::uintptr_t cuda_stream) {
                 rhs_.gpu_data(), n, cuda_stream);
         }
 
-        // SDF-volume contact (cloth ⇄ animated implicit body).  Same
-        // shape as the static-contact pass above, but the body's
+        // SDF-volume contacts (cloth ⇄ animated implicit bodies).
+        // Same shape as the static-contact pass above, but each body's
         // signed distance comes from a trilinear-sampled voxel grid
         // and its rigid pose may move between frames; the slip cache
         // uses the relative velocity `v_particle - v_body` so a
         // particle riding the body experiences zero spurious slip.
-        if (sdf_contact_.active()) {
+        // The vector loop is a no-op when no SDF bodies were added.
+        for (auto& contact_ptr : sdf_contacts_) {
+            auto& contact = *contact_ptr;
+            if (!contact.active()) continue;
             CHYSX_NVTX_RANGE_COLOUR("step::sdf_contact_detect",
                                     0xff8e44ad);
-            sdf_contact_.detect(
+            contact.detect(
                 x_n_.gpu_data(),
                 n,
                 cuda_stream,
                 reinterpret_cast<const math::Vec3f*>(buffers_.vel.data()),
                 dt);
-            sdf_contact_.accumulate_gradient(
-                rhs_.gpu_data(), n, cuda_stream);
+            contact.accumulate_gradient(
+                rhs_.gpu_data(), n, cuda_stream,
+                nullptr, nullptr, dt);
+        }
+
+        // Mesh-body contacts (cloth ⇄ animated rigid triangle meshes).
+        // Same pipeline shape as SDF contacts but uses BVH point query.
+        for (auto& mc_ptr : mesh_contacts_) {
+            auto& mc = *mc_ptr;
+            if (!mc.active()) continue;
+            CHYSX_NVTX_RANGE_COLOUR("step::mesh_contact_detect",
+                                    0xff16a085);
+            mc.detect(
+                x_n_.gpu_data(),
+                n,
+                cuda_stream,
+                reinterpret_cast<const math::Vec3f*>(buffers_.vel.data()),
+                dt);
+            mc.accumulate_gradient(
+                rhs_.gpu_data(), n, cuda_stream,
+                nullptr, nullptr, dt);
         }
 
         // Now rhs[i] = grad E(x_n).  Fold in the inertial RHS to get
@@ -839,13 +893,35 @@ void ClothSimulator::step(float dt, std::uintptr_t cuda_stream) {
                 rhs_.gpu_data(), n, cuda_stream);
         }
 
-        // Coulomb-cone post-projection for the SDF body — same
-        // additive role as the static-contact pass above.
-        if (sdf_contact_.active()) {
+        // Coulomb-cone post-projection for each SDF body — same
+        // additive role as the static-contact pass above.  Skipped when
+        // IPC friction is active (friction is already baked into
+        // gradient/Hessian).
+        for (auto& contact_ptr : sdf_contacts_) {
+            auto& contact = *contact_ptr;
+            if (!contact.active()) continue;
+            if (contact.ipc_friction_enabled()) continue;
             CHYSX_NVTX_RANGE_COLOUR("step::sdf_contact_friction",
                                     0xff9b59b6);
-            sdf_contact_.apply_coulomb_friction(
-                rhs_.gpu_data(), n, cuda_stream);
+            const math::Vec3f gv(g.x, g.y, g.z);
+            contact.apply_coulomb_friction(
+                rhs_.gpu_data(), n,
+                mass_.gpu_data(), H_.diag.gpu_data(),
+                gv, inv_dt2, cuda_stream);
+        }
+
+        // Mesh-body Coulomb friction post-projection.
+        for (auto& mc_ptr : mesh_contacts_) {
+            auto& mc = *mc_ptr;
+            if (!mc.active()) continue;
+            if (mc.ipc_friction_enabled()) continue;
+            CHYSX_NVTX_RANGE_COLOUR("step::mesh_contact_friction",
+                                    0xff16a085);
+            const math::Vec3f gv(g.x, g.y, g.z);
+            mc.apply_coulomb_friction(
+                rhs_.gpu_data(), n,
+                mass_.gpu_data(), H_.diag.gpu_data(),
+                gv, inv_dt2, cuda_stream);
         }
     }
 
@@ -934,13 +1010,28 @@ void ClothSimulator::step(float dt, std::uintptr_t cuda_stream) {
             static_contacts_.bake_diag(H_.diag.gpu_data(), n, dt, cuda_stream);
         }
 
-        // SDF-volume contact diagonal — same role as the static
-        // contact bake, just sourced from the SDF detector cache.
-        if (sdf_contact_.active()) {
+        // SDF-volume contact diagonals — same role as the static
+        // contact bake, just sourced from each SDF detector's cache.
+        for (auto& contact_ptr : sdf_contacts_) {
+            auto& contact = *contact_ptr;
+            if (!contact.active()) continue;
             CHYSX_NVTX_RANGE_COLOUR("step::sdf_contact_diag",
                                     0xff8e44ad);
-            sdf_contact_.bake_diag(H_.diag.gpu_data(), n, dt, cuda_stream);
+            contact.bake_diag(H_.diag.gpu_data(), n, dt, cuda_stream);
         }
+
+        // Mesh-body contact diagonals.
+        for (auto& mc_ptr : mesh_contacts_) {
+            auto& mc = *mc_ptr;
+            if (!mc.active()) continue;
+            CHYSX_NVTX_RANGE_COLOUR("step::mesh_contact_diag",
+                                    0xff16a085);
+            mc.bake_diag(H_.diag.gpu_data(), n, dt, cuda_stream);
+        }
+
+        // Note: STICK friction driving is handled by the
+        // apply_coulomb_friction impulse (M*(v_body-v_particle)/dt)
+        // in step 3.  No separate bake_stick_constraint needed.
     }
 
     // ---- 6) PCG solve  (M/dt^2 + H_E + C) dx = rhs ------------------

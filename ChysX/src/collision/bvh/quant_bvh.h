@@ -154,6 +154,12 @@ public:
     const math::Vec2i* query_pairs_dev() const noexcept { return query_pairs_.gpu_data(); }
     math::Vec2i* query_pairs_dev() noexcept { return query_pairs_.gpu_data(); }
 
+    // Accessors for external point-query kernels (MeshContact).
+    const Ull2* nodes_dev() const noexcept { return nodes_.gpu_data(); }
+    const PackedFace* ext_face_dev() const noexcept { return ext_face_.gpu_data(); }
+    const Aabb* scene_bbox_dev() const noexcept { return scene_bbox_.gpu_data(); }
+    int int_size() const noexcept { return (n_leaves_ > 1) ? (n_leaves_ - 1) : 0; }
+
 private:
     int n_leaves_ = 0;
     int max_query_pairs_ = 0;

@@ -45,6 +45,9 @@ pybind11_add_module(_chysx_native MODULE
     src/collision/static_contact.cu
     src/collision/untangle.cu
 
+    # ---- collision: animated mesh body BVH contact -----------------
+    src/collision/mesh_contact.cu
+
     # ---- collision: animated SDF body penalty contact --------------
     src/collision/sdf/sdf_volume.cu
     src/collision/sdf/sdf_contact.cu
