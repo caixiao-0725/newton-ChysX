@@ -11,6 +11,7 @@
 #include "cloth/cloth_simulator.h"
 #include "collision/static_contact.h"
 #include "math/vec.cuh"
+#include "rigid/rigid_simulator.h"
 
 namespace py = pybind11;
 
@@ -980,4 +981,132 @@ spurious slip (and therefore zero spurious friction).  Default
             },
             py::return_value_policy::reference_internal,
             "In-place reference to the simulator's material (mutate freely).");
+
+    // ---- RigidSimulator ---------------------------------------------------
+
+    py::enum_<chysx::rigid::JointTypeArg>(m, "JointType")
+        .value("BALL", chysx::rigid::JointTypeArg::Ball)
+        .value("FIXED", chysx::rigid::JointTypeArg::Fixed);
+
+    py::class_<chysx::rigid::RigidSimulator>(m, "RigidSimulator", R"pbdoc(
+AVBD rigid-body physics simulator.
+
+Build a scene by adding bodies, shapes, and joints, then call
+``finalize()`` to upload to GPU and ``step(dt)`` to advance.
+)pbdoc")
+        .def(py::init<>())
+        .def("add_body",
+             [](chysx::rigid::RigidSimulator& s,
+                float mass,
+                py::array_t<float> inertia_arr,
+                py::array_t<float> com_arr,
+                py::array_t<float> pos_arr,
+                py::array_t<float> quat_arr) -> int {
+                 auto ip = inertia_arr.unchecked<2>();
+                 chysx::math::Mat3f I(
+                     ip(0,0), ip(0,1), ip(0,2),
+                     ip(1,0), ip(1,1), ip(1,2),
+                     ip(2,0), ip(2,1), ip(2,2));
+                 auto cp = com_arr.unchecked<1>();
+                 auto pp = pos_arr.unchecked<1>();
+                 auto qp = quat_arr.unchecked<1>();
+                 return s.add_body(
+                     mass, I,
+                     chysx::math::Vec3f(cp(0), cp(1), cp(2)),
+                     chysx::math::Vec3f(pp(0), pp(1), pp(2)),
+                     chysx::math::Quatf(qp(0), qp(1), qp(2), qp(3)));
+             },
+             py::arg("mass"), py::arg("inertia"), py::arg("com"),
+             py::arg("pos"), py::arg("quat"),
+             "Add a rigid body.  inertia: (3,3), com/pos: (3,), quat: (4,) xyzw.")
+        .def("add_shape_sphere",
+             &chysx::rigid::RigidSimulator::add_shape_sphere,
+             py::arg("body"), py::arg("radius"),
+             py::arg("ke") = 1e4f, py::arg("kd") = 10.f,
+             py::arg("mu") = 0.5f, py::arg("gap") = 0.01f)
+        .def("add_shape_box",
+             [](chysx::rigid::RigidSimulator& s, int body,
+                py::array_t<float> half_arr,
+                float ke, float kd, float mu, float gap) -> int {
+                 auto h = half_arr.unchecked<1>();
+                 return s.add_shape_box(body,
+                     chysx::math::Vec3f(h(0), h(1), h(2)),
+                     ke, kd, mu, gap);
+             },
+             py::arg("body"), py::arg("half_extents"),
+             py::arg("ke") = 1e4f, py::arg("kd") = 10.f,
+             py::arg("mu") = 0.5f, py::arg("gap") = 0.01f)
+        .def("add_shape_capsule",
+             &chysx::rigid::RigidSimulator::add_shape_capsule,
+             py::arg("body"), py::arg("radius"), py::arg("half_height"),
+             py::arg("ke") = 1e4f, py::arg("kd") = 10.f,
+             py::arg("mu") = 0.5f, py::arg("gap") = 0.01f)
+        .def("add_ground_plane",
+             &chysx::rigid::RigidSimulator::add_ground_plane,
+             py::arg("ke") = 1e4f, py::arg("kd") = 10.f,
+             py::arg("mu") = 0.5f)
+        .def("add_joint",
+             [](chysx::rigid::RigidSimulator& s,
+                chysx::rigid::JointTypeArg type,
+                int parent, int child,
+                py::array_t<float> ap, py::array_t<float> fp,
+                py::array_t<float> ac, py::array_t<float> fc) -> int {
+                 auto a1 = ap.unchecked<1>(); auto f1 = fp.unchecked<1>();
+                 auto a2 = ac.unchecked<1>(); auto f2 = fc.unchecked<1>();
+                 return s.add_joint(type, parent, child,
+                     chysx::math::Vec3f(a1(0), a1(1), a1(2)),
+                     chysx::math::Quatf(f1(0), f1(1), f1(2), f1(3)),
+                     chysx::math::Vec3f(a2(0), a2(1), a2(2)),
+                     chysx::math::Quatf(f2(0), f2(1), f2(2), f2(3)));
+             },
+             py::arg("type"), py::arg("parent"), py::arg("child"),
+             py::arg("anchor_parent"), py::arg("frame_parent"),
+             py::arg("anchor_child"), py::arg("frame_child"))
+        .def("finalize", &chysx::rigid::RigidSimulator::finalize)
+        .def("step", &chysx::rigid::RigidSimulator::step,
+             py::arg("dt"), py::arg("cuda_stream") = 0)
+        .def("body_count", &chysx::rigid::RigidSimulator::body_count)
+        .def("shape_count", &chysx::rigid::RigidSimulator::shape_count)
+        .def("joint_count", &chysx::rigid::RigidSimulator::joint_count)
+        .def("contact_count", &chysx::rigid::RigidSimulator::contact_count)
+        .def("get_body_poses",
+             [](chysx::rigid::RigidSimulator& s) {
+                 int n = s.body_count();
+                 py::array_t<float> pos({n, 3});
+                 py::array_t<float> quat({n, 4});
+                 s.get_body_poses(
+                     reinterpret_cast<chysx::math::Vec3f*>(pos.mutable_data()),
+                     reinterpret_cast<chysx::math::Quatf*>(quat.mutable_data()));
+                 return py::make_tuple(pos, quat);
+             },
+             "Returns (positions (N,3), quaternions (N,4)) as numpy arrays.")
+        .def("get_body_velocities",
+             [](chysx::rigid::RigidSimulator& s) {
+                 int n = s.body_count();
+                 py::array_t<float> vel({n, 3});
+                 py::array_t<float> omega({n, 3});
+                 s.get_body_velocities(
+                     reinterpret_cast<chysx::math::Vec3f*>(vel.mutable_data()),
+                     reinterpret_cast<chysx::math::Vec3f*>(omega.mutable_data()));
+                 return py::make_tuple(vel, omega);
+             },
+             "Returns (linear_vel (N,3), angular_vel (N,3)) as numpy arrays.")
+        .def("set_iterations", &chysx::rigid::RigidSimulator::set_iterations, py::arg("n"))
+        .def("set_gravity",
+             [](chysx::rigid::RigidSimulator& s, py::array_t<float> g) {
+                 auto a = g.unchecked<1>();
+                 s.set_gravity(chysx::math::Vec3f(a(0), a(1), a(2)));
+             },
+             py::arg("gravity"))
+        .def("set_contact_hard", &chysx::rigid::RigidSimulator::set_contact_hard, py::arg("hard"))
+        .def("set_contact_history", &chysx::rigid::RigidSimulator::set_contact_history, py::arg("enabled"))
+        .def("set_avbd_alpha", &chysx::rigid::RigidSimulator::set_avbd_alpha, py::arg("alpha"))
+        .def("set_avbd_gamma", &chysx::rigid::RigidSimulator::set_avbd_gamma, py::arg("gamma"))
+        .def("set_avbd_beta", &chysx::rigid::RigidSimulator::set_avbd_beta, py::arg("beta"))
+        .def("set_friction_epsilon", &chysx::rigid::RigidSimulator::set_friction_epsilon, py::arg("eps"))
+        .def("set_stick_motion_eps", &chysx::rigid::RigidSimulator::set_stick_motion_eps, py::arg("eps"))
+        .def("set_stick_deadzone", &chysx::rigid::RigidSimulator::set_stick_deadzone, py::arg("enabled"))
+        .def("set_contact_buffer_size", &chysx::rigid::RigidSimulator::set_contact_buffer_size, py::arg("n"))
+        .def("set_per_body_contact_capacity", &chysx::rigid::RigidSimulator::set_per_body_contact_capacity, py::arg("n"))
+        .def("set_max_broadphase_pairs", &chysx::rigid::RigidSimulator::set_max_broadphase_pairs, py::arg("n"));
 }

@@ -62,6 +62,14 @@ pybind11_add_module(_chysx_native MODULE
     src/constraint/collision/self_collision_constraint.cu
     src/constraint/collision/untangle_constraint.cu
 
+    # ---- rigid-body AVBD solver ------------------------------------
+    src/rigid/avbd_kernels.cu
+    src/rigid/contact_matching.cu
+    src/rigid/graph_coloring.cpp
+    src/rigid/narrow_phase.cu
+    src/rigid/rigid_broadphase.cu
+    src/rigid/rigid_simulator.cu
+
     # ---- top-level cloth simulator + python bindings ----------------
     src/cloth/cloth_simulator.cu
     src/bindings.cpp

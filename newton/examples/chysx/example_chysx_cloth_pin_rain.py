@@ -292,7 +292,7 @@ class Example:
             bending_stiffness=5.0e-4,
             pin_indices=pin_idx,
             pin_stiffness=1.0e8,
-            pcg_iterations=80,
+            pcg_iterations=50,
             surface_density=0.2,
             self_collision_enabled=True,
             self_collision_thickness=self_thickness,
