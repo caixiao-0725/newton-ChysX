@@ -138,7 +138,7 @@ class Example:
         )
 
         # ---- register mesh bodies (static — pose set once) -------------------
-        mesh_thickness = 0.01
+        mesh_thickness = 0.002
         mesh_stiffness = 5.0e4
 
         # Evaluate FK to get body transforms
@@ -176,7 +176,7 @@ class Example:
                 indices=idx_arr,
                 thickness=mesh_thickness,
                 stiffness=mesh_stiffness,
-                friction=2.0,
+                friction=0.0,
                 friction_epsilon=0.01,
                 contact_kd=0.02,
                 ipc_friction=True,

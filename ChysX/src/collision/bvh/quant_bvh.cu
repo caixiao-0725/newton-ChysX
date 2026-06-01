@@ -33,6 +33,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <stdexcept>
 #include <string>
 
@@ -199,7 +200,12 @@ __global__ void calc_split_metric(int n,
                                   int*                 __restrict__ metric) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
-    metric[idx] = (idx != n - 1) ? (32 - __clz(codes[idx] ^ codes[idx + 1])) : 33;
+    if (idx == n - 1) { metric[idx] = 64 * n + idx; return; }
+    const std::uint32_t xor_val = codes[idx] ^ codes[idx + 1];
+    int primary = (xor_val != 0u)
+        ? (32 - __clz(xor_val)) + 31
+        : (-__clz(static_cast<std::uint32_t>(idx) ^ static_cast<std::uint32_t>(idx + 1))) + 31;
+    metric[idx] = primary * n + idx;
 }
 
 // ============================================================================
@@ -264,6 +270,7 @@ __global__ void build_int_nodes_kernel(
         atomicOr(&int_mark[cur], 0x00000001u);
         ext_mark[idx] = 0x00000003u;
     }
+    __threadfence();
 
     while (atomicAdd(&flag[cur], 1u) == 1u) {
         // Second arrival: merge child AABBs into `cur`.
@@ -447,6 +454,154 @@ __global__ void reorder_quantized_nodes(
     nodes[new_id] = node;
 }
 
+// 1024 pairs * 8 bytes = 8 KB shared per block.  Same as cuda-cloth.
+constexpr int kMaxResPerBlock = 1024;
+
+// ============================================================================
+// Full-float (32-byte) node reorder — same topology as the quantized
+// path but stores the AABB as 6 floats instead of 14-bit integers.
+// ============================================================================
+
+__global__ void reorder_full_nodes(
+    int                  int_size,
+    const int*           __restrict__ tk_map,
+    const int*           __restrict__ ext_lca,
+    const Aabb*          __restrict__ ext_box,
+    const int*           __restrict__ unord_int_lc,
+    const std::uint32_t* __restrict__ unord_int_mark,
+    const int*           __restrict__ unord_int_range_y,
+    const Aabb*          __restrict__ unord_int_box,
+    FullBvhNode*         __restrict__ nodes) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= int_size + 1) return;
+
+    // ---- LEAF ----
+    FullBvhNode leaf;
+    leaf.lc = -1;
+    const Aabb& lb = ext_box[idx];
+    leaf.mn_x = lb.mn.x; leaf.mn_y = lb.mn.y; leaf.mn_z = lb.mn.z;
+    leaf.mx_x = lb.mx.x; leaf.mx_y = lb.mx.y; leaf.mx_z = lb.mx.z;
+
+    int escape = ext_lca[idx + 1];
+    if (escape == -1) {
+        leaf.escape = -1;
+    } else {
+        int b_leaf = escape & 1;
+        int e = escape >> 1;
+        leaf.escape = e + (b_leaf ? int_size : 0);
+    }
+    nodes[idx + int_size] = leaf;
+
+    // ---- INTERNAL ----
+    if (idx >= int_size) return;
+
+    FullBvhNode internal;
+    int new_id = tk_map[idx];
+    std::uint32_t mark = unord_int_mark[idx];
+
+    internal.lc = (mark & 1u) ? (unord_int_lc[idx] + int_size)
+                               : tk_map[unord_int_lc[idx]];
+    const Aabb& ib = unord_int_box[idx];
+    internal.mn_x = ib.mn.x; internal.mn_y = ib.mn.y; internal.mn_z = ib.mn.z;
+    internal.mx_x = ib.mx.x; internal.mx_y = ib.mx.y; internal.mx_z = ib.mx.z;
+
+    int int_escape = ext_lca[unord_int_range_y[idx] + 1];
+    if (int_escape == -1) {
+        internal.escape = -1;
+    } else {
+        int b_leaf = int_escape & 1;
+        int e = int_escape >> 1;
+        internal.escape = e + (b_leaf ? int_size : 0);
+    }
+    nodes[new_id] = internal;
+}
+
+// ============================================================================
+// Full-float stackless self-AABB query
+// ============================================================================
+
+__global__ void query_self_aabb_full_kernel(
+    int                      n_leaves,
+    int                      int_size,
+    const Aabb*              __restrict__ leaf_aabbs,
+    const float*             __restrict__ mass,
+    const int*               __restrict__ sorted_id,
+    const PackedFace*        __restrict__ ext_face,
+    const FullBvhNode*       __restrict__ nodes,
+    int*                     __restrict__ pair_count,
+    math::Vec2i*             __restrict__ pair_list,
+    int                      max_pairs) {
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const bool active = tid < n_leaves;
+
+    int my_orig = -1;
+    Aabb bv;
+    if (active) {
+        my_orig = sorted_id[tid];
+        bv = leaf_aabbs[my_orig];
+    }
+
+    __shared__ math::Vec2i s_buf[kMaxResPerBlock];
+    __shared__ int         s_counter;
+    __shared__ int         s_global_off;
+    if (threadIdx.x == 0) s_counter = 0;
+
+    int st = 0;
+
+    while (true) {
+        __syncthreads();
+
+        if (active) {
+            while (st != -1) {
+                const FullBvhNode node = nodes[st];
+
+                bool hit = !(node.mx_x < bv.mn.x || node.mn_x > bv.mx.x ||
+                             node.mx_y < bv.mn.y || node.mn_y > bv.mx.y ||
+                             node.mx_z < bv.mn.z || node.mn_z > bv.mx.z);
+                if (hit) {
+                    if (node.lc == -1) {
+                        const int leaf_slot = st - int_size;
+                        if (tid < leaf_slot) {
+                            int sIdx = atomicAdd(&s_counter, 1);
+                            if (sIdx >= kMaxResPerBlock) break;
+                            s_buf[sIdx] = math::Vec2i(my_orig, ext_face[leaf_slot].w);
+                        }
+                        st = node.escape;
+                    } else {
+                        st = node.lc;
+                    }
+                } else {
+                    st = node.escape;
+                }
+            }
+        }
+
+        __syncthreads();
+        int total = s_counter;
+        if (total > kMaxResPerBlock) total = kMaxResPerBlock;
+
+        if (threadIdx.x == 0)
+            s_global_off = atomicAdd(pair_count, total);
+
+        __syncthreads();
+        const int g_off = s_global_off;
+
+        if (g_off >= max_pairs || total == 0) return;
+        if (threadIdx.x == 0) s_counter = 0;
+
+        bool done = (total < kMaxResPerBlock);
+        if (g_off + total > max_pairs) {
+            total = max_pairs - g_off;
+            done = true;
+        }
+
+        for (int i = threadIdx.x; i < total; i += blockDim.x)
+            pair_list[g_off + i] = s_buf[i];
+
+        if (done) break;
+    }
+}
+
 // ============================================================================
 // Stackless EF query
 //
@@ -500,8 +655,7 @@ __device__ __forceinline__ bool overlaps_ull2_int(const Ull2& a, const IntAabb& 
     return true;
 }
 
-// 1024 pairs * 8 bytes = 8 KB shared per block.  Same as cuda-cloth.
-constexpr int kMaxResPerBlock = 1024;
+// (kMaxResPerBlock moved earlier in the file, before full-float query kernel)
 
 __global__ void query_self_ef_kernel(
     const math::Vec2i*   __restrict__ edges,
@@ -644,6 +798,232 @@ __global__ void query_self_ef_kernel(
 }
 
 // ============================================================================
+// build_primitives without faces: stores only original leaf id in .w
+// ============================================================================
+
+__global__ void build_primitives_no_faces(
+    int n,
+    PackedFace*         __restrict__ prim_face,
+    Aabb*               __restrict__ prim_box,
+    const int*          __restrict__ prim_map,
+    const Aabb*         __restrict__ box) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    const int new_idx = prim_map[idx];
+    PackedFace p;
+    p.x = -1;
+    p.y = -1;
+    p.z = -1;
+    p.w = idx;
+    prim_face[new_idx] = p;
+    prim_box[new_idx]  = box[idx];
+}
+
+// ============================================================================
+// Stackless self-AABB query: each leaf traverses the tree, emitting
+// (original_i, original_j) pairs where i < j.  No covertex filter.
+// ============================================================================
+
+__global__ void query_self_aabb_kernel(
+    int                  n_leaves,
+    int                  int_size,
+    const Aabb*          __restrict__ leaf_aabbs,
+    const float*         __restrict__ mass,
+    const int*           __restrict__ sorted_id,
+    const PackedFace*    __restrict__ ext_face,
+    const Aabb*          __restrict__ scene_box,
+    const Ull2*          __restrict__ nodes,
+    int*                 __restrict__ pair_count,
+    math::Vec2i*         __restrict__ pair_list,
+    int                  max_pairs) {
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const bool active = tid < n_leaves;
+
+    const Aabb sb = scene_box[0];
+    const math::Vec3f origin = sb.mn;
+    const float bucket = static_cast<float>((1 << QuantBvh::aabb_bits) - 2);
+    const float dx = (sb.mx.x - sb.mn.x) / bucket;
+    const float dy = (sb.mx.y - sb.mn.y) / bucket;
+    const float dz = (sb.mx.z - sb.mn.z) / bucket;
+    const float idx_q = 1.0f / fmaxf(dx, 1e-30f);
+    const float idy_q = 1.0f / fmaxf(dy, 1e-30f);
+    const float idz_q = 1.0f / fmaxf(dz, 1e-30f);
+
+    int my_orig = -1;
+    float my_mass = 1.0f;
+    IntAabb bv;
+    if (active) {
+        my_orig = sorted_id[tid];
+        Aabb box = leaf_aabbs[my_orig];
+        if (mass) my_mass = mass[my_orig];
+        bv.mn_x = (int)((box.mn.x - origin.x) * idx_q);
+        bv.mn_y = (int)((box.mn.y - origin.y) * idy_q);
+        bv.mn_z = (int)((box.mn.z - origin.z) * idz_q);
+        bv.mx_x = (int)ceilf((box.mx.x - origin.x) * idx_q);
+        bv.mx_y = (int)ceilf((box.mx.y - origin.y) * idy_q);
+        bv.mx_z = (int)ceilf((box.mx.z - origin.z) * idz_q);
+    }
+
+    __shared__ math::Vec2i s_buf[kMaxResPerBlock];
+    __shared__ int         s_counter;
+    __shared__ int         s_global_off;
+    if (threadIdx.x == 0) s_counter = 0;
+
+    std::uint32_t st = 0u;
+
+    while (true) {
+        __syncthreads();
+
+        if (active) {
+            while (st != QuantBvh::max_index) {
+                Ull2 node = nodes[st];
+                const std::uint32_t lc     = (std::uint32_t)(node.x >> QuantBvh::offset3);
+                const std::uint32_t escape = (std::uint32_t)(node.y >> QuantBvh::offset3);
+
+                if (overlaps_ull2_int(node, bv)) {
+                    if (lc == QuantBvh::max_index) {
+                        const int leaf_slot = static_cast<int>(st) - int_size;
+                        if (tid < leaf_slot) {
+                            int sIdx = atomicAdd(&s_counter, 1);
+                            if (sIdx >= kMaxResPerBlock) {
+                                break;
+                            }
+                            s_buf[sIdx] = math::Vec2i(my_orig, ext_face[leaf_slot].w);
+                        }
+                        st = escape;
+                    } else {
+                        st = lc;
+                    }
+                } else {
+                    st = escape;
+                }
+            }
+        }
+
+        __syncthreads();
+        int total = s_counter;
+        if (total > kMaxResPerBlock) total = kMaxResPerBlock;
+
+        if (threadIdx.x == 0)
+            s_global_off = atomicAdd(pair_count, total);
+
+        __syncthreads();
+        const int g_off = s_global_off;
+
+        if (g_off >= max_pairs || total == 0) return;
+        if (threadIdx.x == 0) s_counter = 0;
+
+        bool done = (total < kMaxResPerBlock);
+        if (g_off + total > max_pairs) {
+            total = max_pairs - g_off;
+            done = true;
+        }
+
+        for (int i = threadIdx.x; i < total; i += blockDim.x)
+            pair_list[g_off + i] = s_buf[i];
+
+        if (done) break;
+    }
+}
+
+// ============================================================================
+// Diagnostic profiling kernel for query_self_aabb performance analysis
+// ============================================================================
+
+struct BvhQueryStats {
+    int total_nodes_visited;       // sum of nodes visited across all threads
+    int total_overlap_hits;        // sum of overlap-test passes (internal + leaf)
+    int total_leaf_hits;           // leaf nodes that passed overlap
+    int total_pairs_emitted;       // actual pairs written
+    int max_nodes_per_thread;      // worst-case single-thread traversal depth
+    int min_nodes_per_thread;      // best-case
+    int total_flushes;             // shared buffer flush count
+    int n_active_threads;          // threads with actual work
+    int total_tree_size;           // 2*n_leaves - 1
+    long long total_nodes_sq;      // sum of (nodes_visited^2) for variance
+};
+
+__global__ void query_self_aabb_profile_kernel(
+    int                  n_leaves,
+    int                  int_size,
+    const Aabb*          __restrict__ leaf_aabbs,
+    const float*         __restrict__ mass,
+    const int*           __restrict__ sorted_id,
+    const PackedFace*    __restrict__ ext_face,
+    const Aabb*          __restrict__ scene_box,
+    const Ull2*          __restrict__ nodes,
+    BvhQueryStats*       __restrict__ stats) {
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const bool active = tid < n_leaves;
+
+    const Aabb sb = scene_box[0];
+    const math::Vec3f origin = sb.mn;
+    const float bucket = static_cast<float>((1 << QuantBvh::aabb_bits) - 2);
+    const float dx = (sb.mx.x - sb.mn.x) / bucket;
+    const float dy = (sb.mx.y - sb.mn.y) / bucket;
+    const float dz = (sb.mx.z - sb.mn.z) / bucket;
+    const float idx_q = 1.0f / fmaxf(dx, 1e-30f);
+    const float idy_q = 1.0f / fmaxf(dy, 1e-30f);
+    const float idz_q = 1.0f / fmaxf(dz, 1e-30f);
+
+    IntAabb bv;
+    if (active) {
+        int my_orig = sorted_id[tid];
+        Aabb box = leaf_aabbs[my_orig];
+        bv.mn_x = (int)((box.mn.x - origin.x) * idx_q);
+        bv.mn_y = (int)((box.mn.y - origin.y) * idy_q);
+        bv.mn_z = (int)((box.mn.z - origin.z) * idz_q);
+        bv.mx_x = (int)ceilf((box.mx.x - origin.x) * idx_q);
+        bv.mx_y = (int)ceilf((box.mx.y - origin.y) * idy_q);
+        bv.mx_z = (int)ceilf((box.mx.z - origin.z) * idz_q);
+    }
+
+    int my_nodes_visited = 0;
+    int my_overlap_hits = 0;
+    int my_leaf_hits = 0;
+    int my_pairs = 0;
+
+    if (active) {
+        std::uint32_t st = 0u;
+        while (st != QuantBvh::max_index) {
+            my_nodes_visited++;
+            Ull2 node = nodes[st];
+            const std::uint32_t lc     = (std::uint32_t)(node.x >> QuantBvh::offset3);
+            const std::uint32_t escape = (std::uint32_t)(node.y >> QuantBvh::offset3);
+
+            if (overlaps_ull2_int(node, bv)) {
+                my_overlap_hits++;
+                if (lc == QuantBvh::max_index) {
+                    my_leaf_hits++;
+                    const int leaf_slot = static_cast<int>(st) - int_size;
+                    if (tid < leaf_slot) {
+                        my_pairs++;
+                    }
+                    st = escape;
+                } else {
+                    st = lc;
+                }
+            } else {
+                st = escape;
+            }
+        }
+    }
+
+    // Reduce per-thread stats to global stats via atomics
+    if (active) {
+        atomicAdd(&stats->total_nodes_visited, my_nodes_visited);
+        atomicAdd(&stats->total_overlap_hits, my_overlap_hits);
+        atomicAdd(&stats->total_leaf_hits, my_leaf_hits);
+        atomicAdd(&stats->total_pairs_emitted, my_pairs);
+        atomicMax(&stats->max_nodes_per_thread, my_nodes_visited);
+        atomicMin(&stats->min_nodes_per_thread, my_nodes_visited);
+        atomicAdd(&stats->n_active_threads, 1);
+        atomicAdd(reinterpret_cast<unsigned long long*>(&stats->total_nodes_sq),
+                  (unsigned long long)my_nodes_visited * my_nodes_visited);
+    }
+}
+
+// ============================================================================
 // Tiny utilities
 // ============================================================================
 
@@ -709,6 +1089,7 @@ void QuantBvh::build(int n_leaves, int max_query_pairs) {
     flag_.resize(N - 1);
 
     nodes_.resize(2 * N - 1);
+    full_nodes_.resize(2 * N - 1);
 
     query_count_.resize(1);
     query_pairs_.resize(static_cast<std::size_t>(max_query_pairs));
@@ -857,6 +1238,301 @@ void QuantBvh::query_self_ef(const math::Vec2i*    edges,
         query_count_.gpu_data(), query_pairs_.gpu_data(),
         max_query_pairs_);
     check_cuda(cudaGetLastError(), "query_self_ef_kernel");
+}
+
+void QuantBvh::refit(const Aabb*        leaf_aabbs,
+                     const math::Vec3f* leaf_centers,
+                     std::uintptr_t     cuda_stream) {
+    if (n_leaves_ <= 1) return;
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+
+    const int N = n_leaves_;
+    Aabb* d_scene = scene_bbox_.gpu_data();
+
+    {
+        const int blocks = std::min(grid_for(N), 1024);
+        scene_aabb_pass1<<<blocks, kBlockDim, 0, stream>>>(
+            leaf_aabbs, N, scene_partial_.gpu_data());
+        scene_aabb_pass2<<<1, kBlockDim, 0, stream>>>(
+            scene_partial_.gpu_data(), blocks, d_scene);
+        check_cuda(cudaGetLastError(), "scene_aabb reduce (no-faces)");
+    }
+
+    compute_morton_and_id<<<grid_for(N), kBlockDim, 0, stream>>>(
+        leaf_centers, d_scene, N,
+        morton_in_.gpu_data(), sorted_id_in_.gpu_data());
+    check_cuda(cudaGetLastError(), "compute_morton_and_id (no-faces)");
+
+    cub::DeviceRadixSort::SortPairs(
+        cub_sort_temp_.gpu_data(), cub_sort_bytes_,
+        morton_in_.gpu_data(), morton_out_.gpu_data(),
+        sorted_id_in_.gpu_data(), sorted_id_.gpu_data(),
+        N, 0, sizeof(std::uint32_t) * 8, stream);
+
+    inverse_mapping_kernel<<<grid_for(N), kBlockDim, 0, stream>>>(
+        N, sorted_id_.gpu_data(), prim_map_.gpu_data());
+    check_cuda(cudaGetLastError(), "inverse_mapping (no-faces)");
+
+    build_primitives_no_faces<<<grid_for(N), kBlockDim, 0, stream>>>(
+        N, ext_face_.gpu_data(), ext_box_.gpu_data(),
+        prim_map_.gpu_data(), leaf_aabbs);
+    check_cuda(cudaGetLastError(), "build_primitives_no_faces");
+
+    calc_split_metric<<<grid_for(N), kBlockDim, 0, stream>>>(
+        N, morton_out_.gpu_data(), metric_.gpu_data());
+    check_cuda(cudaGetLastError(), "calc_split_metric (no-faces)");
+
+    memset_uint_kernel<<<grid_for(N), kBlockDim, 0, stream>>>(
+        ext_mark_.gpu_data(), 7u, N);
+    memset_int_kernel<<<grid_for(N), kBlockDim, 0, stream>>>(
+        reinterpret_cast<int*>(ext_par_.gpu_data()), -1, N);
+    memset_int_kernel<<<grid_for(N + 1), kBlockDim, 0, stream>>>(
+        ext_lca_.gpu_data(), -1, N + 1);
+    memset_uint_kernel<<<grid_for(N - 1), kBlockDim, 0, stream>>>(
+        flag_.gpu_data(), 0u, N - 1);
+    memset_uint_kernel<<<grid_for(N - 1), kBlockDim, 0, stream>>>(
+        int_mark_.gpu_data(), 0u, N - 1);
+
+    build_int_nodes_kernel<<<grid_for(N), kBlockDim, 0, stream>>>(
+        N, count_.gpu_data(), ext_lca_.gpu_data(), metric_.gpu_data(),
+        ext_par_.gpu_data(), ext_mark_.gpu_data(), ext_box_.gpu_data(),
+        int_rc_.gpu_data(), int_lc_.gpu_data(),
+        range_y_.gpu_data(), range_x_.gpu_data(),
+        int_mark_.gpu_data(), int_box_.gpu_data(),
+        flag_.gpu_data(), int_par_.gpu_data());
+    check_cuda(cudaGetLastError(), "build_int_nodes (no-faces)");
+
+    cub::DeviceScan::ExclusiveSum(
+        cub_scan_temp_.gpu_data(), cub_scan_bytes_,
+        count_.gpu_data(), offset_table_.gpu_data(),
+        N, stream);
+
+    calc_int_node_orders<<<grid_for(N), kBlockDim, 0, stream>>>(
+        N, int_lc_.gpu_data(), ext_lca_.gpu_data(),
+        count_.gpu_data(), offset_table_.gpu_data(),
+        tk_map_.gpu_data());
+    check_cuda(cudaGetLastError(), "calc_int_node_orders (no-faces)");
+
+    memset_int_kernel<<<1, 1, 0, stream>>>(
+        ext_lca_.gpu_data() + N, -1, 1);
+
+    update_bvh_ext_links<<<grid_for(N), kBlockDim, 0, stream>>>(
+        N, tk_map_.gpu_data(), ext_lca_.gpu_data(), ext_par_.gpu_data());
+    check_cuda(cudaGetLastError(), "update_bvh_ext_links (no-faces)");
+
+    reorder_quantized_nodes<<<grid_for(N), kBlockDim, 0, stream>>>(
+        N - 1, tk_map_.gpu_data(), ext_lca_.gpu_data(), ext_box_.gpu_data(),
+        int_lc_.gpu_data(), int_mark_.gpu_data(),
+        range_y_.gpu_data(), int_box_.gpu_data(),
+        scene_bbox_.gpu_data(), nodes_.gpu_data());
+    check_cuda(cudaGetLastError(), "reorder_quantized_nodes (no-faces)");
+}
+
+void QuantBvh::query_self_aabb(const Aabb*       leaf_aabbs,
+                                const float*      mass,
+                                std::uintptr_t    cuda_stream) {
+    if (n_leaves_ <= 1) return;
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+
+    clear_int_kernel<<<1, 1, 0, stream>>>(query_count_.gpu_data());
+    query_self_aabb_kernel<<<grid_for(n_leaves_), kBlockDim, 0, stream>>>(
+        n_leaves_, n_leaves_ - 1,
+        leaf_aabbs, mass, sorted_id_.gpu_data(),
+        ext_face_.gpu_data(),
+        scene_bbox_.gpu_data(),
+        nodes_.gpu_data(),
+        query_count_.gpu_data(), query_pairs_.gpu_data(),
+        max_query_pairs_);
+    check_cuda(cudaGetLastError(), "query_self_aabb_kernel");
+}
+
+void QuantBvh::refit_full(const Aabb*        leaf_aabbs,
+                           const math::Vec3f* leaf_centers,
+                           std::uintptr_t     cuda_stream) {
+    if (n_leaves_ <= 1) return;
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+
+    const int N = n_leaves_;
+    Aabb* d_scene = scene_bbox_.gpu_data();
+
+    // Allocate full_nodes_ if needed (2N - 1)
+    if (full_nodes_.gpu_size() < static_cast<std::size_t>(2 * N - 1))
+        full_nodes_.resize(2 * N - 1);
+
+    // Identical build pipeline up to the reorder step
+    {
+        const int blocks = std::min(grid_for(N), 1024);
+        scene_aabb_pass1<<<blocks, kBlockDim, 0, stream>>>(
+            leaf_aabbs, N, scene_partial_.gpu_data());
+        scene_aabb_pass2<<<1, kBlockDim, 0, stream>>>(
+            scene_partial_.gpu_data(), blocks, d_scene);
+        check_cuda(cudaGetLastError(), "scene_aabb reduce (full)");
+    }
+
+    compute_morton_and_id<<<grid_for(N), kBlockDim, 0, stream>>>(
+        leaf_centers, d_scene, N,
+        morton_in_.gpu_data(), sorted_id_in_.gpu_data());
+    check_cuda(cudaGetLastError(), "compute_morton_and_id (full)");
+
+    cub::DeviceRadixSort::SortPairs(
+        cub_sort_temp_.gpu_data(), cub_sort_bytes_,
+        morton_in_.gpu_data(), morton_out_.gpu_data(),
+        sorted_id_in_.gpu_data(), sorted_id_.gpu_data(),
+        N, 0, sizeof(std::uint32_t) * 8, stream);
+
+    inverse_mapping_kernel<<<grid_for(N), kBlockDim, 0, stream>>>(
+        N, sorted_id_.gpu_data(), prim_map_.gpu_data());
+    check_cuda(cudaGetLastError(), "inverse_mapping (full)");
+
+    build_primitives_no_faces<<<grid_for(N), kBlockDim, 0, stream>>>(
+        N, ext_face_.gpu_data(), ext_box_.gpu_data(),
+        prim_map_.gpu_data(), leaf_aabbs);
+    check_cuda(cudaGetLastError(), "build_primitives_no_faces (full)");
+
+    calc_split_metric<<<grid_for(N), kBlockDim, 0, stream>>>(
+        N, morton_out_.gpu_data(), metric_.gpu_data());
+    check_cuda(cudaGetLastError(), "calc_split_metric (full)");
+
+    memset_uint_kernel<<<grid_for(N), kBlockDim, 0, stream>>>(
+        ext_mark_.gpu_data(), 7u, N);
+    memset_int_kernel<<<grid_for(N), kBlockDim, 0, stream>>>(
+        reinterpret_cast<int*>(ext_par_.gpu_data()), -1, N);
+    memset_int_kernel<<<grid_for(N + 1), kBlockDim, 0, stream>>>(
+        ext_lca_.gpu_data(), -1, N + 1);
+    memset_uint_kernel<<<grid_for(N - 1), kBlockDim, 0, stream>>>(
+        flag_.gpu_data(), 0u, N - 1);
+    memset_uint_kernel<<<grid_for(N - 1), kBlockDim, 0, stream>>>(
+        int_mark_.gpu_data(), 0u, N - 1);
+    memset_int_kernel<<<grid_for(N - 1), kBlockDim, 0, stream>>>(
+        int_lc_.gpu_data(), -1, N - 1);
+    memset_int_kernel<<<grid_for(N - 1), kBlockDim, 0, stream>>>(
+        int_rc_.gpu_data(), -1, N - 1);
+
+    build_int_nodes_kernel<<<grid_for(N), kBlockDim, 0, stream>>>(
+        N, count_.gpu_data(), ext_lca_.gpu_data(), metric_.gpu_data(),
+        ext_par_.gpu_data(), ext_mark_.gpu_data(), ext_box_.gpu_data(),
+        int_rc_.gpu_data(), int_lc_.gpu_data(),
+        range_y_.gpu_data(), range_x_.gpu_data(),
+        int_mark_.gpu_data(), int_box_.gpu_data(),
+        flag_.gpu_data(), int_par_.gpu_data());
+    check_cuda(cudaGetLastError(), "build_int_nodes (full)");
+
+    cub::DeviceScan::ExclusiveSum(
+        cub_scan_temp_.gpu_data(), cub_scan_bytes_,
+        count_.gpu_data(), offset_table_.gpu_data(),
+        N, stream);
+
+    calc_int_node_orders<<<grid_for(N), kBlockDim, 0, stream>>>(
+        N, int_lc_.gpu_data(), ext_lca_.gpu_data(),
+        count_.gpu_data(), offset_table_.gpu_data(),
+        tk_map_.gpu_data());
+    check_cuda(cudaGetLastError(), "calc_int_node_orders (full)");
+
+    memset_int_kernel<<<1, 1, 0, stream>>>(
+        ext_lca_.gpu_data() + N, -1, 1);
+
+    update_bvh_ext_links<<<grid_for(N), kBlockDim, 0, stream>>>(
+        N, tk_map_.gpu_data(), ext_lca_.gpu_data(), ext_par_.gpu_data());
+    check_cuda(cudaGetLastError(), "update_bvh_ext_links (full)");
+
+    // Full-float reorder instead of quantized
+    reorder_full_nodes<<<grid_for(N), kBlockDim, 0, stream>>>(
+        N - 1, tk_map_.gpu_data(), ext_lca_.gpu_data(), ext_box_.gpu_data(),
+        int_lc_.gpu_data(), int_mark_.gpu_data(),
+        range_y_.gpu_data(), int_box_.gpu_data(),
+        full_nodes_.gpu_data());
+    check_cuda(cudaGetLastError(), "reorder_full_nodes");
+}
+
+void QuantBvh::query_self_aabb_full(const Aabb*       leaf_aabbs,
+                                     const float*      mass,
+                                     std::uintptr_t    cuda_stream) {
+    if (n_leaves_ <= 1) return;
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+
+    clear_int_kernel<<<1, 1, 0, stream>>>(query_count_.gpu_data());
+    query_self_aabb_full_kernel<<<grid_for(n_leaves_), kBlockDim, 0, stream>>>(
+        n_leaves_, n_leaves_ - 1,
+        leaf_aabbs, mass, sorted_id_.gpu_data(),
+        ext_face_.gpu_data(),
+        full_nodes_.gpu_data(),
+        query_count_.gpu_data(), query_pairs_.gpu_data(),
+        max_query_pairs_);
+    check_cuda(cudaGetLastError(), "query_self_aabb_full_kernel");
+}
+
+void QuantBvh::profile_query_self_aabb(const Aabb*       leaf_aabbs,
+                                        const float*      mass,
+                                        std::uintptr_t    cuda_stream) {
+    if (n_leaves_ <= 1) return;
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+
+    BvhQueryStats stats_host{};
+    BvhQueryStats* stats_dev = nullptr;
+    check_cuda(cudaMalloc(&stats_dev, sizeof(BvhQueryStats)), "alloc stats");
+    stats_host.min_nodes_per_thread = INT_MAX;
+    check_cuda(cudaMemcpy(stats_dev, &stats_host, sizeof(BvhQueryStats),
+                          cudaMemcpyHostToDevice), "init stats");
+
+    // Time the profiling kernel
+    cudaEvent_t t0, t1;
+    cudaEventCreate(&t0); cudaEventCreate(&t1);
+    cudaEventRecord(t0, stream);
+
+    query_self_aabb_profile_kernel<<<grid_for(n_leaves_), kBlockDim, 0, stream>>>(
+        n_leaves_, n_leaves_ - 1,
+        leaf_aabbs, mass, sorted_id_.gpu_data(),
+        ext_face_.gpu_data(),
+        scene_bbox_.gpu_data(),
+        nodes_.gpu_data(),
+        stats_dev);
+    check_cuda(cudaGetLastError(), "profile kernel");
+
+    cudaEventRecord(t1, stream);
+    cudaEventSynchronize(t1);
+    float ms = 0;
+    cudaEventElapsedTime(&ms, t0, t1);
+    cudaEventDestroy(t0); cudaEventDestroy(t1);
+
+    check_cuda(cudaMemcpy(&stats_host, stats_dev, sizeof(BvhQueryStats),
+                          cudaMemcpyDeviceToHost), "download stats");
+    cudaFree(stats_dev);
+
+    int N = stats_host.n_active_threads;
+    if (N <= 0) return;
+
+    double avg_nodes = (double)stats_host.total_nodes_visited / N;
+    double variance = (double)stats_host.total_nodes_sq / N - avg_nodes * avg_nodes;
+    double stddev = variance > 0 ? sqrt(variance) : 0;
+    int tree_size = 2 * n_leaves_ - 1;
+
+    fprintf(stderr,
+        "\n=== BVH query_self_aabb PROFILE ===\n"
+        "  n_leaves           = %d\n"
+        "  tree_size (2N-1)   = %d\n"
+        "  kernel_time        = %.3f ms\n"
+        "  active_threads     = %d\n"
+        "  total_nodes_visited= %d\n"
+        "  avg_nodes/thread   = %.1f\n"
+        "  min_nodes/thread   = %d\n"
+        "  max_nodes/thread   = %d\n"
+        "  stddev_nodes       = %.1f\n"
+        "  total_overlap_hits = %d  (avg %.1f/thread)\n"
+        "  total_leaf_hits    = %d  (avg %.1f/thread)\n"
+        "  total_pairs        = %d  (avg %.1f/thread)\n"
+        "  traversal_ratio    = %.1f%%  (avg_nodes / tree_size)\n"
+        "===================================\n",
+        n_leaves_, tree_size, ms,
+        N,
+        stats_host.total_nodes_visited,
+        avg_nodes,
+        stats_host.min_nodes_per_thread,
+        stats_host.max_nodes_per_thread,
+        stddev,
+        stats_host.total_overlap_hits, (double)stats_host.total_overlap_hits / N,
+        stats_host.total_leaf_hits, (double)stats_host.total_leaf_hits / N,
+        stats_host.total_pairs_emitted, (double)stats_host.total_pairs_emitted / N,
+        avg_nodes / tree_size * 100.0);
 }
 
 }  // namespace collision

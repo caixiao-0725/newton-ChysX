@@ -195,14 +195,14 @@ class Example:
             static_contact_friction=0.03,
             untangle_enabled=True,
             untangle_thickness=self_thickness,
-            untangle_stiffness=3.0e3,
+            untangle_stiffness=2.0e3,
             untangle_max_contacts_factor=sc_narrow_factor,
         )
 
         # ---- register robot mesh bodies in ChysX ----------------------------
         mesh_thickness = 0.004
         mesh_stiffness = 5.0e4
-        mesh_friction = 1.0
+        mesh_friction = 0.0
         self._mesh_body_indices = []
 
         for shape_idx, mesh_data in enumerate(self._robot_shape_meshes):

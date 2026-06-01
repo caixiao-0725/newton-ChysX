@@ -349,10 +349,10 @@ void TriangleStretchConstraint::set_triangles_from_positions(
         n,
         c, s);
 
-    if (cuda_stream == 0) {
-        check_cuda(cudaStreamSynchronize(stream),
-                   "cudaStreamSynchronize after triangle_rest_shape_kernel");
-    }
+    //if (cuda_stream == 0) {
+    //    check_cuda(cudaStreamSynchronize(stream),
+    //               "cudaStreamSynchronize after triangle_rest_shape_kernel");
+    //}
 }
 
 float TriangleStretchConstraint::compute_energy(
@@ -400,10 +400,10 @@ void TriangleStretchConstraint::accumulate_gradient(
         out_grad.data(),
         n);
 
-    if (cuda_stream == 0) {
-        check_cuda(cudaStreamSynchronize(stream),
-                   "cudaStreamSynchronize(triangle_gradient_kernel)");
-    }
+    //if (cuda_stream == 0) {
+    //    check_cuda(cudaStreamSynchronize(stream),
+    //               "cudaStreamSynchronize(triangle_gradient_kernel)");
+    //}
 }
 
 void TriangleStretchConstraint::accumulate_hessian(
@@ -431,10 +431,10 @@ void TriangleStretchConstraint::accumulate_hessian(
         A.values.gpu_data(),
         n);
 
-    if (cuda_stream == 0) {
-        check_cuda(cudaStreamSynchronize(stream),
-                   "cudaStreamSynchronize(triangle_hessian_scatter_kernel)");
-    }
+    //if (cuda_stream == 0) {
+    //    check_cuda(cudaStreamSynchronize(stream),
+    //               "cudaStreamSynchronize(triangle_hessian_scatter_kernel)");
+    //}
 }
 
 }  // namespace constraint

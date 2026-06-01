@@ -568,10 +568,10 @@ void ClothSimulator::redistribute_mass_area_weighted(
         mass_.gpu_data(), inv_mass, particle_count);
     check_cuda(cudaGetLastError(), "mass_to_inv_mass kernel launch");
 
-    if (cuda_stream == 0) {
-        check_cuda(cudaStreamSynchronize(stream),
-                   "cudaStreamSynchronize(redistribute_mass)");
-    }
+    //if (cuda_stream == 0) {
+    //    check_cuda(cudaStreamSynchronize(stream),
+    //               "cudaStreamSynchronize(redistribute_mass)");
+    //}
 }
 
 void ClothSimulator::ensure_hessian_topology() {
@@ -971,16 +971,13 @@ void ClothSimulator::step(float dt, std::uintptr_t cuda_stream) {
         // PCG SpMV).  Without this, stiff penalty contacts converge
         // unacceptably slowly and the residual lets the cloth
         // self-penetrate.
-        if (self_collision_enabled_ &&
-            self_collision_thickness_ > 0.0f &&
-            self_collision_.stiffness() > 0.0f &&
-            mesh_topology_.valid()) {
+        {
             const collision::ContactSpMVOp diag_op =
-                self_collision_.make_spmv_op(self_collision_detector_);
-            if (diag_op.active()) {
-                collision::bake_contact_diag(
-                    H_.diag.gpu_data(), n, diag_op, 1.0f, cuda_stream);
-            }
+                self_collision_enabled_
+                    ? self_collision_.make_spmv_op(self_collision_detector_)
+                    : collision::ContactSpMVOp{};
+            collision::bake_contact_diag(
+                H_.diag.gpu_data(), n, diag_op, 1.0f, cuda_stream);
         }
 
         // Untangle Hessian diagonal: 5-vertex tangles only land on
@@ -1059,13 +1056,11 @@ void ClothSimulator::step(float dt, std::uintptr_t cuda_stream) {
         solver::PCGParams params;
         params.max_iterations = pcg_max_iterations_;
         const collision::ContactSpMVOp contact_op =
-            self_collision_.make_spmv_op(self_collision_detector_);
-        const collision::ContactSpMVOp* contact_ptr =
-            (self_collision_enabled_ && contact_op.active())
-                ? &contact_op
-                : nullptr;
+            self_collision_enabled_
+                ? self_collision_.make_spmv_op(self_collision_detector_)
+                : collision::ContactSpMVOp{};
         pcg_.solve(H_, rhs_span, dx_span, params, cuda_stream,
-                   contact_ptr);
+                   contact_op);
     }
 
     // ---- 7) finalize positions / velocities -------------------------

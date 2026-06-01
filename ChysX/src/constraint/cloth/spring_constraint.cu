@@ -273,9 +273,9 @@ void SpringConstraint::accumulate_hessian(DeviceSpan<math::Vec3f> positions,
         A.values.gpu_data(),
         n);
 
-    if (cuda_stream == 0) {
-        check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
-    }
+    //if (cuda_stream == 0) {
+    //    check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
+    //}
 }
 
 }  // namespace constraint

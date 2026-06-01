@@ -11,7 +11,7 @@
 #include "cloth/cloth_simulator.h"
 #include "collision/static_contact.h"
 #include "math/vec.cuh"
-#include "rigid/rigid_simulator.h"
+#include "rigid/newton_avbd/rigid_simulator.h"
 
 namespace py = pybind11;
 

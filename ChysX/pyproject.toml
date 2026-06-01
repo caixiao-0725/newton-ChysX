@@ -19,3 +19,5 @@ build-dir = "build/{wheel_tag}"
 [tool.scikit-build.cmake.define]
 # RTX 5090 = sm_120 (Blackwell). Override via env var if you have a different GPU.
 CMAKE_CUDA_ARCHITECTURES = { env = "CHYSX_CUDA_ARCH", default = "120" }
+CHYSX_BUILD_PYTHON = "ON"
+CHYSX_BUILD_SCENES = "OFF"

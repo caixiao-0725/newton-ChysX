@@ -10,6 +10,7 @@
 #include <string>
 
 #include "friction.cuh"
+#include "zero_count.h"
 
 namespace chysx {
 namespace collision {
@@ -206,19 +207,21 @@ void bake_contact_diag(math::Mat3f* diag_blocks,
                        const ContactSpMVOp& op,
                        float alpha,
                        std::uintptr_t cuda_stream) {
-    if (!op.active() || diag_blocks == nullptr) return;
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+
+    const int launch_size = (op.max_contacts > 0) ? op.max_contacts : 1;
+    const int* count_ptr  = op.count_dev ? op.count_dev : zero_count_ptr();
 
     const float k_alpha = alpha * op.stiffness;
     const float fric_mu =
         op.friction_active() ? op.friction_mu : 0.0f;
     const math::Vec4f* slip_ptr =
         op.friction_active() ? op.slips : nullptr;
-    bake_contact_diag_kernel<<<grid_for(op.max_contacts), kBlockDim, 0, stream>>>(
+    bake_contact_diag_kernel<<<grid_for(launch_size), kBlockDim, 0, stream>>>(
         op.pairs,
         op.weights,
         slip_ptr,
-        op.count_dev,
+        count_ptr,
         op.max_contacts,
         k_alpha,
         fric_mu,
@@ -233,19 +236,26 @@ void apply_contact_spmv(const ContactSpMVOp& op,
                         int /*n_particles*/,
                         float alpha,
                         std::uintptr_t cuda_stream) {
-    if (!op.active() || x == nullptr || y == nullptr) return;
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+
+    // Always launch at least 1 block so the kernel sequence is
+    // identical with or without active contacts — keeps a surrounding
+    // CUDA Graph capture valid across frames.  When `max_contacts` is
+    // 0 (or count_dev reads 0) every thread exits immediately via the
+    // `c >= n` guard inside the kernel.
+    const int launch_size = (op.max_contacts > 0) ? op.max_contacts : 1;
+    const int* count_ptr  = op.count_dev ? op.count_dev : zero_count_ptr();
 
     const float k_alpha = alpha * op.stiffness;
     const float fric_mu =
         op.friction_active() ? op.friction_mu : 0.0f;
     const math::Vec4f* slip_ptr =
         op.friction_active() ? op.slips : nullptr;
-    apply_contact_spmv_kernel<<<grid_for(op.max_contacts), kBlockDim, 0, stream>>>(
+    apply_contact_spmv_kernel<<<grid_for(launch_size), kBlockDim, 0, stream>>>(
         op.pairs,
         op.weights,
         slip_ptr,
-        op.count_dev,
+        count_ptr,
         op.max_contacts,
         k_alpha,
         fric_mu,
