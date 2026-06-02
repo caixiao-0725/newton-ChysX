@@ -304,46 +304,16 @@ int PCGSolver::solve(const sparse::BlockCSR3& A,
 
     CHYSX_NVTX_RANGE_COLOUR("pcg::solve", 0xfff1c40f);
 
-    // Ensure the zero-count fallback pointer is materialised before any
-    // graph capture (its one-time cudaMalloc must not fire during capture).
     collision::zero_count_ptr();
 
     const int max_iter = params.max_iterations;
 
-    // Graph hit — replay on the cached stream.
-    if (graph_exec_ && graph_n_ == n && graph_max_iter_ == max_iter) {
-        check_cuda(cudaGraphLaunch(graph_exec_, graph_stream_),
-                   "cudaGraphLaunch");
-        return max_iter;
-    }
-
-    // Graph miss — (re)capture.
-    destroy_graph();
-
-    // CUDA graph capture requires a non-default stream.
-    check_cuda(cudaStreamCreate(&graph_stream_), "cudaStreamCreate");
-
-    auto gs = reinterpret_cast<std::uintptr_t>(graph_stream_);
-
-    check_cuda(cudaStreamBeginCapture(graph_stream_,
-                                      cudaStreamCaptureModeRelaxed),
-               "cudaStreamBeginCapture");
-
-    emit_pcg(A, b, x, max_iter, gs, contact,
+    // CUDA Graph capture disabled: the cloth simulator reassembles
+    // b (RHS) and A.diag every frame, so a captured graph replays
+    // stale data.  Emit kernels directly onto the caller's stream.
+    emit_pcg(A, b, x, max_iter, cuda_stream, contact,
              r_, p_, z_, Ap_, M_inv_, coeff_);
 
-    cudaGraph_t graph = nullptr;
-    check_cuda(cudaStreamEndCapture(graph_stream_, &graph),
-               "cudaStreamEndCapture");
-    check_cuda(cudaGraphInstantiate(&graph_exec_, graph, 0),
-               "cudaGraphInstantiate");
-    cudaGraphDestroy(graph);
-
-    graph_n_ = n;
-    graph_max_iter_ = max_iter;
-
-    check_cuda(cudaGraphLaunch(graph_exec_, graph_stream_),
-               "cudaGraphLaunch");
     return max_iter;
 }
 
