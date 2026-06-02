@@ -37,6 +37,7 @@ from . import _chysx_native
 
 ClothMaterial = _chysx_native.ClothMaterial
 ClothSimulator = _chysx_native.ClothSimulator
+CoupledSimulator = _chysx_native.CoupledSimulator
 
 __version__ = "0.1.0"
 
@@ -44,5 +45,6 @@ __version__ = "0.1.0"
 __all__ = [
     "ClothMaterial",
     "ClothSimulator",
+    "CoupledSimulator",
     "__version__",
 ]

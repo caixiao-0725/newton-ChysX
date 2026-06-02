@@ -574,12 +574,134 @@ void ClothSimulator::redistribute_mass_area_weighted(
     //}
 }
 
+// ---------------------------------------------------------------------------
+// Tet-volume mass scatter:  m_v += (density * |det(Dm)| / 6) / 4
+//   = density * V_tet / 4 per vertex.
+// ---------------------------------------------------------------------------
+namespace {
+__global__ void scatter_tet_mass_kernel(
+    const math::Vec4i* __restrict__ tets,
+    const math::Vec3f* __restrict__ pos,
+    float density_over_4,
+    float* __restrict__ mass_out,
+    int n_tet) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= n_tet) return;
+
+    const math::Vec4i id = tets[t];
+    const math::Vec3f p0 = pos[id.x], p1 = pos[id.y];
+    const math::Vec3f p2 = pos[id.z], p3 = pos[id.w];
+    const math::Vec3f e1 = p1 - p0, e2 = p2 - p0, e3 = p3 - p0;
+    const float vol = fabsf(math::dot(e1, math::cross(e2, e3))) / 6.0f;
+    const float m = density_over_4 * vol;
+    atomicAdd(&mass_out[id.x], m);
+    atomicAdd(&mass_out[id.y], m);
+    atomicAdd(&mass_out[id.z], m);
+    atomicAdd(&mass_out[id.w], m);
+}
+}  // namespace
+
+void ClothSimulator::set_tet_mesh(
+    const math::Vec4i* host_tets,
+    const math::Vec3f* host_materials,
+    int n_tets,
+    std::uintptr_t cuda_stream) {
+    if (n_tets <= 0) {
+        tet_fem_.set_tets_from_positions(nullptr, nullptr, 0,
+                                          buffers_.pos, cuda_stream);
+        topology_dirty_ = true;
+        return;
+    }
+    if (buffers_.pos.data() == nullptr) {
+        throw std::runtime_error(
+            "ClothSimulator::set_tet_mesh: external positions must be set "
+            "first via set_external_buffers().");
+    }
+
+    tet_fem_.set_tets_from_positions(host_tets, host_materials, n_tets,
+                                      buffers_.pos, cuda_stream);
+    topology_dirty_ = true;
+}
+
+void ClothSimulator::redistribute_mass_volume_weighted(
+    float density,
+    std::uintptr_t inv_mass_ptr,
+    int particle_count,
+    std::uintptr_t cuda_stream) {
+    if (particle_count <= 0) return;
+    if (inv_mass_ptr == 0) {
+        throw std::invalid_argument(
+            "ClothSimulator::redistribute_mass_volume_weighted: "
+            "inv_mass_ptr must be non-null");
+    }
+    if (density <= 0.0f) {
+        throw std::invalid_argument(
+            "ClothSimulator::redistribute_mass_volume_weighted: "
+            "density must be positive");
+    }
+
+    const int n_tet = tet_fem_.size();
+    if (n_tet == 0) {
+        throw std::runtime_error(
+            "ClothSimulator::redistribute_mass_volume_weighted: "
+            "call set_tet_mesh(...) before redistributing mass.");
+    }
+    if (buffers_.pos.data() == nullptr ||
+        static_cast<int>(buffers_.pos.size()) < particle_count) {
+        throw std::runtime_error(
+            "ClothSimulator::redistribute_mass_volume_weighted: "
+            "external positions must be set first via set_external_buffers().");
+    }
+
+    const auto stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+    auto* inv_mass = reinterpret_cast<float*>(inv_mass_ptr);
+
+    if (static_cast<int>(mass_.gpu_size()) < particle_count) {
+        mass_.resize(particle_count);
+    }
+    check_cuda(cudaMemsetAsync(mass_.gpu_data(), 0,
+                               particle_count * sizeof(float), stream),
+               "cudaMemsetAsync(mass scratch)");
+
+    constexpr int block = 256;
+    const int grid_tet = (n_tet + block - 1) / block;
+    scatter_tet_mass_kernel<<<grid_tet, block, 0, stream>>>(
+        tet_fem_.indices().gpu_data(),
+        buffers_.pos.data(),
+        density / 4.0f,
+        mass_.gpu_data(), n_tet);
+    check_cuda(cudaGetLastError(), "scatter_tet_mass kernel launch");
+
+    const int grid_v = (particle_count + block - 1) / block;
+    mass_to_inv_mass_kernel<<<grid_v, block, 0, stream>>>(
+        mass_.gpu_data(), inv_mass, particle_count);
+    check_cuda(cudaGetLastError(), "mass_to_inv_mass kernel launch");
+}
+
+void ClothSimulator::build_vbd_coloring() {
+    const int n_tet = tet_fem_.size();
+    if (n_tet == 0) {
+        throw std::runtime_error(
+            "ClothSimulator::build_vbd_coloring: call set_tet_mesh() first.");
+    }
+    const int n = buffers_.particle_count();
+    if (n <= 0) return;
+
+    if (tet_fem_.indices().cpu_data() == nullptr)
+        tet_fem_.indices().copy_to_host();
+
+    const math::Vec4i* host_tets = tet_fem_.indices().cpu_data();
+    vbd_.build_coloring(host_tets, n_tet, n);
+    vbd_.build_adjacency(host_tets, n_tet, n);
+}
+
 void ClothSimulator::ensure_hessian_topology() {
     const int N = buffers_.particle_count();
     if (N <= 0) return;
 
     // Collect off-diagonal (i, j) pairs from FEM stretch + FEM shear +
-    // bending.  Pin contributes diagonal-only and is skipped here; the
+    // bending + tet FEM.  Pin contributes diagonal-only and is skipped
+    // here; the
     // diagonal entries are stored implicitly in `BlockCSR3::diag` and
     // don't need a CSR slot.
     //
@@ -638,18 +760,33 @@ void ClothSimulator::ensure_hessian_topology() {
         }
     }
 
+    // Tet FEM: 4 verts per element → 12 directed (i, j) pairs.
+    const int n_tet = tet_fem_.size();
+    if (n_tet > 0) {
+        const math::Vec4i* tets = tet_fem_.indices().cpu_data();
+        rows.reserve(rows.size() + 12u * static_cast<std::size_t>(n_tet));
+        cols.reserve(cols.size() + 12u * static_cast<std::size_t>(n_tet));
+        for (int e = 0; e < n_tet; ++e) {
+            const int v[4] = { tets[e].x, tets[e].y, tets[e].z, tets[e].w };
+            for (int a = 0; a < 4; ++a) {
+                for (int b = 0; b < 4; ++b) {
+                    if (a != b && v[a] != v[b]) {
+                        rows.push_back(v[a]);
+                        cols.push_back(v[b]);
+                    }
+                }
+            }
+        }
+    }
+
     H_.build_topology(N, rows.data(), cols.data(),
                       static_cast<int>(rows.size()));
 
-    // Bind every constraint's per-block slot LUT against the freshly
-    // built topology.  Each call walks `indices_.cpu_data()` and runs
-    // a binary search per block on the host — fine for cloth-scale
-    // problems and amortised across many simulation steps.
     pins_.bind_hessian_layout(H_);
-    // springs_.bind_hessian_layout(H_);  // disabled — see comment above
     fem_stretch_.bind_hessian_layout(H_);
     fem_shear_.bind_hessian_layout(H_);
     bending_.bind_hessian_layout(H_);
+    tet_fem_.bind_hessian_layout(H_);
 
     H_num_block_rows_ = N;
     topology_dirty_ = false;
@@ -679,6 +816,48 @@ void ClothSimulator::step(float dt, std::uintptr_t cuda_stream) {
 
     const int n = buffers_.particle_count();
     if (n <= 0) {
+        return;
+    }
+
+    // ---- VBD solver path (bypasses PCG entirely) --------------------
+    if (solver_type_ == SolverType::VBD) {
+        if (buffers_.pos.data() == nullptr || buffers_.vel.data() == nullptr) {
+            throw std::runtime_error(
+                "ClothSimulator::step(VBD): pos/vel must be set.");
+        }
+        if (dt <= 0.0f) {
+            throw std::invalid_argument(
+                "ClothSimulator::step(VBD): dt must be positive.");
+        }
+        if (vbd_.num_colors() == 0) {
+            throw std::runtime_error(
+                "ClothSimulator::step(VBD): call build_vbd_coloring() first.");
+        }
+
+        const int n_tet = tet_fem_.size();
+        DeviceSpan<math::Vec3f> pos_span(
+            reinterpret_cast<math::Vec3f*>(buffers_.pos.data()),
+            static_cast<std::size_t>(n));
+        DeviceSpan<math::Vec3f> vel_span(
+            reinterpret_cast<math::Vec3f*>(buffers_.vel.data()),
+            static_cast<std::size_t>(n));
+        DeviceSpan<float> inv_mass_span(
+            buffers_.inv_mass.data(),
+            static_cast<std::size_t>(n));
+        DeviceSpan<math::Vec4i> tet_idx_span(
+            tet_fem_.indices().gpu_data(),
+            static_cast<std::size_t>(n_tet));
+        DeviceSpan<math::Mat3f> tet_poses_span(
+            tet_fem_.Dm_inv().gpu_data(),
+            static_cast<std::size_t>(n_tet));
+        DeviceSpan<math::Vec3f> tet_mats_span(
+            tet_fem_.materials().gpu_data(),
+            static_cast<std::size_t>(n_tet));
+
+        const math::Vec3f gravity(material_.gx, material_.gy, material_.gz);
+        vbd_.step(pos_span, vel_span, inv_mass_span,
+                  tet_idx_span, tet_poses_span, tet_mats_span,
+                  gravity, dt, vbd_iterations_, cuda_stream);
         return;
     }
     if (buffers_.pos.data() == nullptr || buffers_.vel.data() == nullptr) {
@@ -739,15 +918,20 @@ void ClothSimulator::step(float dt, std::uintptr_t cuda_stream) {
                    "memset rhs = 0");
 
         pins_.accumulate_gradient(x_n_span, rhs_span, cuda_stream);
-        // SpringConstraint is intentionally not part of the pipeline:
-        // FEM stretch + shear already cover edge-stretch resistance,
-        // and adding a Hookean spring on top would double-count
-        // in-plane stiffness.  Kept around for diagnostics, but not
-        // accumulated into the solve.
-        // springs_.accumulate_gradient(x_n_span, rhs_span, cuda_stream);
+        // springs_ disabled — FEM stretch + shear already covers edges.
         fem_stretch_.accumulate_gradient(x_n_span, rhs_span, cuda_stream);
         fem_shear_.accumulate_gradient(x_n_span, rhs_span, cuda_stream);
         bending_.accumulate_gradient(x_n_span, rhs_span, cuda_stream);
+
+        // Tet FEM: set previous positions (for damping) and dt, then
+        // accumulate gradient.  pos_prev for the first step is x_n
+        // itself (zero velocity → zero damping force), which is
+        // correct because we snapshot x_n before any modify.
+        if (tet_fem_.size() > 0) {
+            tet_fem_.set_previous_positions(x_n_span);
+            tet_fem_.set_dt(dt);
+            tet_fem_.accumulate_gradient(x_n_span, rhs_span, cuda_stream);
+        }
 
         // Self-collision: detect at x_n (the equilibrium-like
         // configuration we linearise around -- not at x_tilde, which
@@ -949,11 +1133,12 @@ void ClothSimulator::step(float dt, std::uintptr_t cuda_stream) {
         // Hessian is also evaluated at x_n; same rationale as the
         // gradient.  M/dt^2 inertial diagonal is added afterwards.
         pins_.accumulate_hessian(x_n_span, H_, cuda_stream);
-        // springs_ disabled — see comment in the gradient block above.
-        // springs_.accumulate_hessian(x_n_span, H_, cuda_stream);
         fem_stretch_.accumulate_hessian(x_n_span, H_, cuda_stream);
         fem_shear_.accumulate_hessian(x_n_span, H_, cuda_stream);
         bending_.accumulate_hessian(x_n_span, H_, cuda_stream);
+        if (tet_fem_.size() > 0) {
+            tet_fem_.accumulate_hessian(x_n_span, H_, cuda_stream);
+        }
 
         const float inv_dt2 = 1.0f / (dt * dt);
         add_inertia_diag_kernel<<<grid, block, 0, stream>>>(

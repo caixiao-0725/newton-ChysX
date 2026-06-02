@@ -38,16 +38,23 @@
 #include "../constraint/cloth/triangle_stretch_constraint.h"
 #include "../constraint/collision/self_collision_constraint.h"
 #include "../constraint/collision/untangle_constraint.h"
+#include "../constraint/softbody/tet_fem_constraint.h"
 #include "../math/matrix.cuh"
 #include "../math/vec.cuh"
 #include "../memory/cuda_array.h"
 #include "../solver/pcg_solver.h"
+#include "../solver/vbd_solver.h"
 #include "../sparse/block_csr.h"
 #include "cloth_buffers.h"
 #include "cloth_material.h"
 
 namespace chysx {
 namespace cloth {
+
+enum class SolverType {
+    PCG = 0,
+    VBD = 1,
+};
 
 class ClothSimulator {
 public:
@@ -198,6 +205,34 @@ public:
     constraint::BendingConstraint& bending() noexcept { return bending_; }
     const constraint::BendingConstraint& bending() const noexcept {
         return bending_;
+    }
+
+    // ---- tetrahedral FEM (stable Neo-Hookean) ---------------------------
+    //
+    // Install tetrahedral FEM constraints.  Each tet has its own
+    // material (mu, lambda, k_damp).  Dm_inv is computed from the
+    // current externally-bound positions (rest configuration).
+    //
+    // `host_tets` is (v0, v1, v2, v3) per tet; `host_materials` is
+    // (mu, lambda, k_damp) per tet.  Call after set_external_buffers().
+    void set_tet_mesh(
+        const math::Vec4i* host_tets,
+        const math::Vec3f* host_materials,
+        int n_tets,
+        std::uintptr_t cuda_stream = 0);
+
+    // Volume-weighted lumped mass for tet meshes: scatter
+    // rho * V_tet / 4 into each vertex's mass.  Overwrites inv_mass
+    // in place.  Requires set_tet_mesh() + set_external_buffers().
+    void redistribute_mass_volume_weighted(
+        float density,
+        std::uintptr_t inv_mass_ptr,
+        int particle_count,
+        std::uintptr_t cuda_stream = 0);
+
+    constraint::TetFEMConstraint& tet_fem() noexcept { return tet_fem_; }
+    const constraint::TetFEMConstraint& tet_fem() const noexcept {
+        return tet_fem_;
     }
 
     // ---- self-collision (DCD) -----------------------------------------
@@ -564,6 +599,23 @@ public:
     }
     int pcg_iterations() const noexcept { return pcg_max_iterations_; }
 
+    // ---- solver type (PCG vs VBD) ------------------------------------
+    void set_solver_type(SolverType t) noexcept { solver_type_ = t; }
+    SolverType solver_type() const noexcept { return solver_type_; }
+
+    void set_vbd_iterations(int n) noexcept {
+        vbd_iterations_ = (n > 0) ? n : 1;
+    }
+    int vbd_iterations() const noexcept { return vbd_iterations_; }
+
+    // Build VBD coloring + adjacency from the currently installed
+    // tet mesh.  Must be called after set_tet_mesh() before stepping
+    // with solver_type == VBD.
+    void build_vbd_coloring();
+
+    solver::VBDSolver& vbd_solver() noexcept { return vbd_; }
+    const solver::VBDSolver& vbd_solver() const noexcept { return vbd_; }
+
     // ---- diagnostics --------------------------------------------------
     //
     // Read-only accessors for the linear system that the *last* call
@@ -617,6 +669,7 @@ private:
     constraint::TriangleStretchConstraint fem_stretch_;
     constraint::TriangleStretchConstraint fem_shear_;
     constraint::BendingConstraint         bending_;
+    constraint::TetFEMConstraint          tet_fem_;
     constraint::SelfCollisionConstraint   self_collision_;
     collision::MeshTopology               mesh_topology_;
     collision::SelfCollisionDetector      self_collision_detector_;
@@ -658,6 +711,11 @@ private:
     bool topology_dirty_ = true;     // mesh / springs / fem changed?
     solver::PCGSolver pcg_;
     int pcg_max_iterations_ = 50;
+
+    // VBD solver (alternative to PCG)
+    SolverType solver_type_ = SolverType::PCG;
+    solver::VBDSolver vbd_;
+    int vbd_iterations_ = 10;
 };
 
 }  // namespace cloth

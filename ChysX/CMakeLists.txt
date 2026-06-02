@@ -18,6 +18,7 @@ add_library(chysx_core STATIC
     src/memory/cuda_array.cu
     src/sparse/block_csr.cu
     src/solver/pcg_solver.cu
+    src/solver/vbd_solver.cu
 
     src/collision/bvh/lbvh.cu
     src/collision/bvh/quant_bvh.cu
@@ -36,6 +37,7 @@ add_library(chysx_core STATIC
     src/constraint/cloth/bending_constraint.cu
     src/constraint/collision/self_collision_constraint.cu
     src/constraint/collision/untangle_constraint.cu
+    src/constraint/softbody/tet_fem_constraint.cu
 
     src/rigid/newton_avbd/avbd_kernels.cu
     src/rigid/newton_avbd/contact_matching.cu
@@ -57,6 +59,7 @@ add_library(chysx_core STATIC
     src/rigid/avbd_cpu/avbd_gpu_solver.cu
 
     src/cloth/cloth_simulator.cu
+    src/coupled/coupled_simulator.cu
 )
 
 target_include_directories(chysx_core PUBLIC src)

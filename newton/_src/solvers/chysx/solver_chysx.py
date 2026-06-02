@@ -308,6 +308,10 @@ class SolverChysX(SolverBase):
         untangle_thickness: float = 0.0,
         untangle_stiffness: float = 2.0e3,
         untangle_max_contacts_factor: int = 8,
+        tet_fem_enabled: bool = False,
+        volume_density: float | None = None,
+        solver_type: str = "pcg",
+        vbd_iterations: int = 10,
     ):
         super().__init__(model=model)
 
@@ -419,6 +423,40 @@ class SolverChysX(SolverBase):
                 self._sim.build_bending_from_current_positions(
                     stiffness=float(bending_stiffness)
                 )
+
+        # Tetrahedral FEM — install tet elements from Newton's Model
+        # if requested and the model has tetrahedra.
+        if (
+            tet_fem_enabled
+            and getattr(model, "tet_indices", None) is not None
+            and model.tet_count > 0
+            and model.particle_count > 0
+        ):
+            tet_idx = model.tet_indices.numpy().reshape(-1, 4).astype(np.int32)
+            tet_mat_raw = model.tet_materials.numpy().reshape(-1, 3).astype(np.float32)
+            tets_np = np.ascontiguousarray(tet_idx)
+            mats_np = np.ascontiguousarray(tet_mat_raw)
+            self._sim.set_tet_mesh(tets_np, mats_np)
+
+            if (
+                volume_density is not None
+                and volume_density > 0.0
+                and getattr(model, "particle_inv_mass", None) is not None
+            ):
+                self._sim.redistribute_mass_volume_weighted(
+                    density=float(volume_density),
+                    inv_mass_ptr=model.particle_inv_mass.ptr,
+                    particle_count=model.particle_count,
+                )
+
+        # Solver type configuration
+        if solver_type.lower() == "vbd":
+            self._sim.set_solver_type(1)
+            self._sim.set_vbd_iterations(vbd_iterations)
+            if tet_fem_enabled:
+                self._sim.build_vbd_coloring()
+        else:
+            self._sim.set_solver_type(0)
 
         # Pin configuration: targets are read once from the model's
         # initial particle_q so the user can express pinning purely

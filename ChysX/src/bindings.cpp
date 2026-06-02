@@ -10,6 +10,7 @@
 #include "cloth/cloth_material.h"
 #include "cloth/cloth_simulator.h"
 #include "collision/static_contact.h"
+#include "coupled/coupled_simulator.h"
 #include "math/vec.cuh"
 #include "rigid/newton_avbd/rigid_simulator.h"
 
@@ -312,6 +313,94 @@ stiffness : float
                 return self.bending().size();
             },
             "Number of currently installed bending dihedrals.")
+        // ---- solver type (PCG vs VBD) --------------------------------
+        .def("set_solver_type",
+             [](chysx::cloth::ClothSimulator& self, int t) {
+                 self.set_solver_type(
+                     static_cast<chysx::cloth::SolverType>(t));
+             },
+             py::arg("solver_type"),
+             R"pbdoc(
+Set the solver type: 0 = PCG (implicit Euler), 1 = VBD (Gauss-Seidel).
+)pbdoc")
+        .def("set_vbd_iterations",
+             &chysx::cloth::ClothSimulator::set_vbd_iterations,
+             py::arg("iterations"),
+             R"pbdoc(
+Set the number of VBD Gauss-Seidel iterations per substep.
+)pbdoc")
+        .def("build_vbd_coloring",
+             &chysx::cloth::ClothSimulator::build_vbd_coloring,
+             R"pbdoc(
+Build graph coloring and vertex-tet adjacency for VBD.
+Must be called after set_tet_mesh() and before stepping with VBD.
+)pbdoc")
+        .def(
+            "num_vbd_colors",
+            [](const chysx::cloth::ClothSimulator& self) {
+                return self.vbd_solver().num_colors();
+            },
+            "Number of colors in the VBD graph coloring.")
+        // ---- tetrahedral FEM (stable Neo-Hookean) --------------------
+        .def(
+            "set_tet_mesh",
+            [](chysx::cloth::ClothSimulator& self,
+               py::array_t<int, py::array::c_style | py::array::forcecast> tets,
+               py::array_t<float, py::array::c_style | py::array::forcecast> materials,
+               std::uintptr_t cuda_stream) {
+                if (tets.ndim() != 2 || tets.shape(1) != 4) {
+                    throw std::invalid_argument(
+                        "set_tet_mesh: tets must have shape (T, 4) int32");
+                }
+                if (materials.ndim() != 2 || materials.shape(1) != 3) {
+                    throw std::invalid_argument(
+                        "set_tet_mesh: materials must have shape (T, 3) float32");
+                }
+                const int n = static_cast<int>(tets.shape(0));
+                if (materials.shape(0) != n) {
+                    throw std::invalid_argument(
+                        "set_tet_mesh: tets and materials must have the same "
+                        "number of rows");
+                }
+                auto tets_ptr = reinterpret_cast<const chysx::math::Vec4i*>(
+                    tets.data());
+                auto mats_ptr = reinterpret_cast<const chysx::math::Vec3f*>(
+                    materials.data());
+                self.set_tet_mesh(tets_ptr, mats_ptr, n, cuda_stream);
+            },
+            py::arg("tets"),
+            py::arg("materials"),
+            py::arg("cuda_stream") = 0,
+            R"pbdoc(
+Install tetrahedral FEM constraints with stable Neo-Hookean material.
+
+Parameters
+----------
+tets : ndarray, shape (T, 4), dtype int32
+    Vertex indices ``(v0, v1, v2, v3)`` per tet.
+materials : ndarray, shape (T, 3), dtype float32
+    ``(mu, lambda, k_damp)`` per tet [Pa, Pa, Pa·s].
+)pbdoc")
+        .def("redistribute_mass_volume_weighted",
+             &chysx::cloth::ClothSimulator::redistribute_mass_volume_weighted,
+             py::arg("density"),
+             py::arg("inv_mass_ptr"),
+             py::arg("particle_count"),
+             py::arg("cuda_stream") = 0,
+             R"pbdoc(
+Redistribute particle masses using volume-weighted lumping from the
+installed tet mesh.  Each tet contributes ``density * V_tet / 4`` to
+each of its four vertices.
+
+Requires ``set_tet_mesh(...)`` and ``set_external_buffers(...)`` to have
+been called first.
+)pbdoc")
+        .def(
+            "num_tets",
+            [](const chysx::cloth::ClothSimulator& self) {
+                return self.tet_fem().size();
+            },
+            "Number of currently installed tetrahedral FEM elements.")
         // ---- self-collision (DCD, brute-force VF for v1) ------------
         .def("set_self_collision_enabled",
              &chysx::cloth::ClothSimulator::set_self_collision_enabled,
@@ -1109,4 +1198,171 @@ Build a scene by adding bodies, shapes, and joints, then call
         .def("set_contact_buffer_size", &chysx::rigid::RigidSimulator::set_contact_buffer_size, py::arg("n"))
         .def("set_per_body_contact_capacity", &chysx::rigid::RigidSimulator::set_per_body_contact_capacity, py::arg("n"))
         .def("set_max_broadphase_pairs", &chysx::rigid::RigidSimulator::set_max_broadphase_pairs, py::arg("n"));
+
+    // ---- CoupledSimulator ------------------------------------------------
+
+    py::class_<chysx::coupled::CoupledSimulator>(m, "CoupledSimulator", R"pbdoc(
+VBD-based coupled rigid-soft body simulator.
+
+Rigid bodies are solved externally (e.g. Featherstone); this class
+only handles particle VBD + body-particle contact forces.
+)pbdoc")
+        .def(py::init<>())
+        .def("build_coloring",
+             [](chysx::coupled::CoupledSimulator& self,
+                py::array_t<int, py::array::c_style | py::array::forcecast> tets,
+                int n_particles) {
+                 if (tets.ndim() != 2 || tets.shape(1) != 4)
+                     throw std::runtime_error("tets must be (T, 4)");
+                 const int n_tets = static_cast<int>(tets.shape(0));
+                 auto* ptr = reinterpret_cast<const chysx::math::Vec4i*>(tets.data());
+                 self.build_coloring(ptr, n_tets, n_particles);
+                 self.build_adjacency(ptr, n_tets, n_particles);
+             },
+             py::arg("tets"), py::arg("n_particles"),
+             "Build graph coloring + vertex-tet adjacency from (T,4) tet array.")
+        .def("set_coloring",
+             [](chysx::coupled::CoupledSimulator& self,
+                py::array_t<int, py::array::c_style | py::array::forcecast> colors,
+                py::array_t<int, py::array::c_style | py::array::forcecast> tets,
+                int n_particles) {
+                 if (colors.ndim() != 1 || colors.shape(0) != n_particles)
+                     throw std::runtime_error("colors must be (n_particles,)");
+                 self.set_coloring(colors.data(), n_particles);
+                 if (tets.ndim() == 2 && tets.shape(1) == 4) {
+                     const int n_tets = static_cast<int>(tets.shape(0));
+                     auto* ptr = reinterpret_cast<const chysx::math::Vec4i*>(tets.data());
+                     self.build_adjacency(ptr, n_tets, n_particles);
+                 }
+             },
+             py::arg("colors"), py::arg("tets"), py::arg("n_particles"),
+             "Import an external coloring and build adjacency from (T,4) tet array.")
+        .def("num_colors",
+             &chysx::coupled::CoupledSimulator::num_colors,
+             "Number of colors in the VBD graph coloring.")
+        .def("step",
+             [](chysx::coupled::CoupledSimulator& self,
+                // Particle buffers (device pointers)
+                std::uintptr_t pos_ptr,
+                std::uintptr_t vel_ptr,
+                std::uintptr_t inv_mass_ptr,
+                int n_particles,
+                // Tet buffers
+                std::uintptr_t tet_indices_ptr,
+                std::uintptr_t tet_poses_ptr,
+                std::uintptr_t tet_materials_ptr,
+                int n_tets,
+                // Physics
+                float gx, float gy, float gz,
+                float dt,
+                int iterations,
+                float friction_epsilon,
+                // Body-particle contact data (device pointers, optional)
+                std::uintptr_t contact_particle_ptr,
+                std::uintptr_t contact_count_ptr,
+                int contact_max,
+                std::uintptr_t contact_ke_ptr,
+                std::uintptr_t contact_kd_ptr,
+                std::uintptr_t contact_mu_ptr,
+                std::uintptr_t contact_shape_ptr,
+                std::uintptr_t contact_body_pos_ptr,
+                std::uintptr_t contact_body_vel_ptr,
+                std::uintptr_t contact_normal_ptr,
+                // External body state (device pointers)
+                std::uintptr_t body_q_ptr,
+                std::uintptr_t body_q_prev_ptr,
+                std::uintptr_t body_qd_ptr,
+                std::uintptr_t body_com_ptr,
+                std::uintptr_t shape_body_ptr,
+                std::uintptr_t particle_radius_ptr,
+                std::uintptr_t particle_colors_ptr,
+                int n_bodies,
+                int n_shapes,
+                // Stream
+                std::uintptr_t cuda_stream) {
+
+                 using namespace chysx;
+
+                 DeviceSpan<math::Vec3f> pos(
+                     reinterpret_cast<math::Vec3f*>(pos_ptr), n_particles);
+                 DeviceSpan<math::Vec3f> vel(
+                     reinterpret_cast<math::Vec3f*>(vel_ptr), n_particles);
+                 DeviceSpan<float> inv_mass(
+                     reinterpret_cast<float*>(inv_mass_ptr), n_particles);
+                 DeviceSpan<math::Vec4i> tet_indices(
+                     reinterpret_cast<math::Vec4i*>(tet_indices_ptr), n_tets);
+                 DeviceSpan<math::Mat3f> tet_poses(
+                     reinterpret_cast<math::Mat3f*>(tet_poses_ptr), n_tets);
+                 DeviceSpan<math::Vec3f> tet_materials(
+                     reinterpret_cast<math::Vec3f*>(tet_materials_ptr), n_tets);
+
+                 coupled::BodyParticleContacts contacts;
+                 contacts.contact_particle = reinterpret_cast<int*>(contact_particle_ptr);
+                 contacts.contact_count = reinterpret_cast<int*>(contact_count_ptr);
+                 contacts.contact_max = contact_max;
+                 contacts.contact_ke = reinterpret_cast<float*>(contact_ke_ptr);
+                 contacts.contact_kd = reinterpret_cast<float*>(contact_kd_ptr);
+                 contacts.contact_mu = reinterpret_cast<float*>(contact_mu_ptr);
+                 contacts.contact_shape = reinterpret_cast<int*>(contact_shape_ptr);
+                 contacts.contact_body_pos = reinterpret_cast<float*>(contact_body_pos_ptr);
+                 contacts.contact_body_vel = reinterpret_cast<float*>(contact_body_vel_ptr);
+                 contacts.contact_normal = reinterpret_cast<float*>(contact_normal_ptr);
+
+                 coupled::ExternalBodies bodies;
+                 bodies.body_q = reinterpret_cast<float*>(body_q_ptr);
+                 bodies.body_q_prev = reinterpret_cast<float*>(body_q_prev_ptr);
+                 bodies.body_qd = reinterpret_cast<float*>(body_qd_ptr);
+                 bodies.body_com = reinterpret_cast<float*>(body_com_ptr);
+                 bodies.shape_body = reinterpret_cast<int*>(shape_body_ptr);
+                 bodies.particle_radius = reinterpret_cast<float*>(particle_radius_ptr);
+                 bodies.particle_colors = reinterpret_cast<int*>(particle_colors_ptr);
+                 bodies.n_bodies = n_bodies;
+                 bodies.n_shapes = n_shapes;
+
+                 self.step(
+                     pos, vel, inv_mass,
+                     tet_indices, tet_poses, tet_materials,
+                     math::Vec3f(gx, gy, gz),
+                     dt, iterations,
+                     contacts, bodies, friction_epsilon,
+                     cuda_stream);
+             },
+             py::arg("pos_ptr"),
+             py::arg("vel_ptr"),
+             py::arg("inv_mass_ptr"),
+             py::arg("n_particles"),
+             py::arg("tet_indices_ptr"),
+             py::arg("tet_poses_ptr"),
+             py::arg("tet_materials_ptr"),
+             py::arg("n_tets"),
+             py::arg("gx"), py::arg("gy"), py::arg("gz"),
+             py::arg("dt"),
+             py::arg("iterations"),
+             py::arg("friction_epsilon"),
+             py::arg("contact_particle_ptr") = 0,
+             py::arg("contact_count_ptr") = 0,
+             py::arg("contact_max") = 0,
+             py::arg("contact_ke_ptr") = 0,
+             py::arg("contact_kd_ptr") = 0,
+             py::arg("contact_mu_ptr") = 0,
+             py::arg("contact_shape_ptr") = 0,
+             py::arg("contact_body_pos_ptr") = 0,
+             py::arg("contact_body_vel_ptr") = 0,
+             py::arg("contact_normal_ptr") = 0,
+             py::arg("body_q_ptr") = 0,
+             py::arg("body_q_prev_ptr") = 0,
+             py::arg("body_qd_ptr") = 0,
+             py::arg("body_com_ptr") = 0,
+             py::arg("shape_body_ptr") = 0,
+             py::arg("particle_radius_ptr") = 0,
+             py::arg("particle_colors_ptr") = 0,
+             py::arg("n_bodies") = 0,
+             py::arg("n_shapes") = 0,
+             py::arg("cuda_stream") = 0,
+             R"pbdoc(
+Run one VBD substep with optional body-particle contacts.
+
+All pointer arguments are raw CUDA device pointers (int).
+Contact and body arguments can be 0 (null) to run without coupling.
+)pbdoc");
 }
