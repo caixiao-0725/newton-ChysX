@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-from .chysx import SolverChysX, SolverChysXCoupled
+from .chysx import SolverChysX, SolverChysXCoupled, SolverChysXFeatherstone
 from .featherstone import SolverFeatherstone
 from .flags import SolverNotifyFlags
 from .implicit_mpm import SolverImplicitMPM
@@ -17,6 +17,7 @@ __all__ = [
     "SolverBase",
     "SolverChysX",
     "SolverChysXCoupled",
+    "SolverChysXFeatherstone",
     "SolverFeatherstone",
     "SolverImplicitMPM",
     "SolverKamino",

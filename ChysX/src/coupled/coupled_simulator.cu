@@ -349,5 +349,103 @@ void CoupledSimulator::step(
     }
 }
 
+// ====================================================================
+// Collision pipeline integration
+// ====================================================================
+
+void CoupledSimulator::add_collision_shape(
+    int body, int geo_type,
+    float sx, float sy, float sz,
+    const float* local_tf_7, int flags,
+    uint64_t mesh_id,
+    float mat_ke, float mat_kd, float mat_mu) {
+    collision_.add_shape(body, geo_type, math::Vec3f(sx, sy, sz),
+                         local_tf_7, flags, mesh_id,
+                         mat_ke, mat_kd, mat_mu);
+}
+
+void CoupledSimulator::finalize_collision(int max_soft_contacts) {
+    collision_.finalize(max_soft_contacts);
+}
+
+void CoupledSimulator::step_with_collision(
+    DeviceSpan<math::Vec3f> pos,
+    DeviceSpan<math::Vec3f> vel,
+    DeviceSpan<float> inv_mass,
+    DeviceSpan<math::Vec4i> tet_indices,
+    DeviceSpan<math::Mat3f> tet_poses,
+    DeviceSpan<math::Vec3f> tet_materials,
+    math::Vec3f gravity,
+    float dt,
+    int iterations,
+    const float* body_q,
+    const float* body_q_prev,
+    int n_bodies,
+    const float* particle_radius,
+    const int*   particle_flags,
+    float margin,
+    float friction_epsilon,
+    float soft_contact_ke,
+    float soft_contact_kd,
+    float soft_contact_mu,
+    std::uintptr_t cuda_stream)
+{
+    const int n = static_cast<int>(pos.size());
+    if (n <= 0) return;
+
+    // 1. Run collision detection
+    collision_.collide(
+        pos.data(), particle_radius, particle_flags,
+        n, body_q, n_bodies, margin, cuda_stream);
+
+    // 2. Initialize per-contact material coefficients
+    collision_.init_contact_materials(
+        soft_contact_ke, soft_contact_kd, soft_contact_mu, cuda_stream);
+
+    // 3. Build the BodyParticleContacts struct from collision results
+    BodyParticleContacts contacts;
+    contacts.contact_particle = collision_.contact_particle_ptr();
+    contacts.contact_count    = collision_.contact_count_ptr();
+    contacts.contact_max      = collision_.contact_max();
+    contacts.contact_ke       = collision_.contact_ke_ptr();
+    contacts.contact_kd       = collision_.contact_kd_ptr();
+    contacts.contact_mu       = collision_.contact_mu_ptr();
+    contacts.contact_shape    = collision_.contact_shape_ptr();
+    contacts.contact_body_pos = collision_.contact_body_pos_ptr();
+    contacts.contact_body_vel = collision_.contact_body_vel_ptr();
+    contacts.contact_normal   = collision_.contact_normal_ptr();
+
+    // 4. Build the ExternalBodies struct
+    ExternalBodies bodies;
+    bodies.body_q       = const_cast<float*>(body_q);
+    bodies.body_q_prev  = const_cast<float*>(body_q_prev);
+    bodies.body_qd      = nullptr;
+    bodies.body_com     = nullptr;
+    bodies.shape_body   = collision_.shape_body_ptr();
+    bodies.particle_radius = const_cast<float*>(particle_radius);
+    bodies.particle_colors = nullptr;  // use VBD's internal coloring
+    bodies.n_bodies     = n_bodies;
+    bodies.n_shapes     = collision_.shape_count();
+
+    // 5. Run VBD step with contacts (reuse existing path)
+    ContactCallbackData cb_data;
+    cb_data.dt = dt;
+    cb_data.friction_epsilon = friction_epsilon;
+    cb_data.n_particles = n;
+    cb_data.contacts = &contacts;
+    cb_data.bodies = &bodies;
+    cb_data.vbd_particle_colors = vbd_.particle_colors_ptr();
+
+    vbd_.step_with_contacts(
+        pos, vel, inv_mass,
+        tet_indices, tet_poses, tet_materials,
+        gravity, dt, iterations,
+        contact_callback_fn,
+        &cb_data,
+        particle_forces_.gpu_data(),
+        particle_hessians_.gpu_data(),
+        cuda_stream);
+}
+
 }  // namespace coupled
 }  // namespace chysx

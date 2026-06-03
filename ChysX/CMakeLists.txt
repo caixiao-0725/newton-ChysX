@@ -30,6 +30,7 @@ add_library(chysx_core STATIC
     src/collision/mesh_contact.cu
     src/collision/sdf/sdf_volume.cu
     src/collision/sdf/sdf_contact.cu
+    src/collision/collision_pipeline.cu
 
     src/constraint/cloth/pin_constraint.cu
     src/constraint/cloth/spring_constraint.cu
@@ -57,6 +58,8 @@ add_library(chysx_core STATIC
     src/rigid/avbd_cpu/avbd_narrowphase_gpu.cu
     src/rigid/avbd_cpu/avbd_graph_coloring.cu
     src/rigid/avbd_cpu/avbd_gpu_solver.cu
+
+    src/rigid/featherstone/featherstone_solver.cu
 
     src/cloth/cloth_simulator.cu
     src/coupled/coupled_simulator.cu

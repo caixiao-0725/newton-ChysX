@@ -3,5 +3,6 @@
 
 from .solver_chysx import SolverChysX
 from .solver_chysx_coupled import SolverChysXCoupled
+from .solver_chysx_featherstone import SolverChysXFeatherstone
 
-__all__ = ["SolverChysX", "SolverChysXCoupled"]
+__all__ = ["SolverChysX", "SolverChysXCoupled", "SolverChysXFeatherstone"]

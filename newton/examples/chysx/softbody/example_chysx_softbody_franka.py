@@ -6,9 +6,10 @@
 #
 # Identical to newton/examples/softbody/example_softbody_franka.py but
 # using ChysX's CoupledSimulator (VBD in CUDA C++) instead of Newton's
-# SolverVBD for the particle soft-body solve.  Featherstone / IK still
-# runs through Newton; CollisionPipeline still provides the body-particle
-# contacts.  ChysX only handles the VBD particle step + contact forces.
+# SolverVBD for the particle soft-body solve, and ChysX's native
+# FeatherstoneSolver (C++/CUDA) for rigid body dynamics.  Only the IK
+# solver still runs through Newton/Warp.  Collision detection uses
+# ChysX's native CollisionPipeline (C++/CUDA).
 ###########################################################################
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ import newton.examples
 import newton.ik as ik
 import newton.utils
 from newton import ModelBuilder, eval_fk
-from newton.solvers import SolverChysXCoupled, SolverFeatherstone
+from newton.solvers import SolverChysXCoupled, SolverChysXFeatherstone
 
 
 @wp.kernel
@@ -114,25 +115,21 @@ class Example:
 
         self.control = self.model.control()
 
-        self.collision_pipeline = newton.CollisionPipeline(
-            self.model,
-            soft_contact_margin=self.soft_body_contact_margin,
-        )
-        self.contacts = self.collision_pipeline.contacts()
-
         self.sim_time = 0.0
 
-        self.robot_solver = SolverFeatherstone(
+        self.robot_solver = SolverChysXFeatherstone(
             self.model, update_mass_matrix_interval=self.sim_substeps
         )
 
         self.set_up_ik()
 
-        # ChysX VBD coupled solver (replaces SolverVBD)
+        # ChysX VBD coupled solver with native collision pipeline
         self.soft_solver = SolverChysXCoupled(
             self.model,
             iterations=self.iterations,
             friction_epsilon=1e-2,
+            use_native_collision=True,
+            soft_contact_margin=self.soft_body_contact_margin,
         )
 
         self.viewer.set_model(self.model)
@@ -192,12 +189,10 @@ class Example:
         self.ik_iters = 24
 
     def capture(self):
-        if wp.get_device().is_cuda:
-            with wp.ScopedCapture() as capture:
-                self.simulate()
-            self.graph = capture.graph
-        else:
-            self.graph = None
+        # CUDA graph capture is disabled when using ChysX's native
+        # collision pipeline because collision detection includes atomic
+        # operations that produce variable-length output each frame.
+        self.graph = None
 
     def create_articulation(self, builder):
         asset_path = newton.utils.download_asset("franka_emika_panda")
@@ -301,9 +296,7 @@ class Example:
             self.model.particle_count = particle_count
             self.model.gravity.assign(self.gravity_earth)
 
-            self.collision_pipeline.collide(self.state_0, self.contacts)
-
-            self.soft_solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
+            self.soft_solver.step(self.state_0, self.state_1, self.control, None, self.sim_dt)
 
             self.state_0, self.state_1 = self.state_1, self.state_0
             self.sim_time += self.sim_dt

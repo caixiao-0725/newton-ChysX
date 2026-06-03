@@ -13,6 +13,7 @@
 #include "coupled/coupled_simulator.h"
 #include "math/vec.cuh"
 #include "rigid/newton_avbd/rigid_simulator.h"
+#include "rigid/featherstone/featherstone_solver.h"
 
 namespace py = pybind11;
 
@@ -1240,6 +1241,113 @@ only handles particle VBD + body-particle contact forces.
         .def("num_colors",
              &chysx::coupled::CoupledSimulator::num_colors,
              "Number of colors in the VBD graph coloring.")
+        .def("add_collision_shape",
+             [](chysx::coupled::CoupledSimulator& self,
+                int body, int geo_type,
+                float sx, float sy, float sz,
+                py::array_t<float, py::array::c_style | py::array::forcecast> local_tf,
+                int flags, uint64_t mesh_id,
+                float mat_ke, float mat_kd, float mat_mu) {
+                 if (local_tf.ndim() != 1 || local_tf.shape(0) != 7)
+                     throw std::runtime_error("local_tf must be (7,) float32");
+                 self.add_collision_shape(
+                     body, geo_type, sx, sy, sz,
+                     local_tf.data(), flags, mesh_id,
+                     mat_ke, mat_kd, mat_mu);
+             },
+             py::arg("body"), py::arg("geo_type"),
+             py::arg("sx"), py::arg("sy"), py::arg("sz"),
+             py::arg("local_tf"), py::arg("flags"),
+             py::arg("mesh_id") = 0,
+             py::arg("mat_ke") = 0.0f, py::arg("mat_kd") = 0.0f,
+             py::arg("mat_mu") = 0.0f,
+             "Register a collision shape for the internal collision pipeline.")
+        .def("finalize_collision",
+             &chysx::coupled::CoupledSimulator::finalize_collision,
+             py::arg("max_soft_contacts") = 0,
+             "Upload shape data to GPU and allocate contact buffers.")
+        .def("step_with_collision",
+             [](chysx::coupled::CoupledSimulator& self,
+                std::uintptr_t pos_ptr,
+                std::uintptr_t vel_ptr,
+                std::uintptr_t inv_mass_ptr,
+                int n_particles,
+                std::uintptr_t tet_indices_ptr,
+                std::uintptr_t tet_poses_ptr,
+                std::uintptr_t tet_materials_ptr,
+                int n_tets,
+                float gx, float gy, float gz,
+                float dt,
+                int iterations,
+                std::uintptr_t body_q_ptr,
+                std::uintptr_t body_q_prev_ptr,
+                int n_bodies,
+                std::uintptr_t particle_radius_ptr,
+                std::uintptr_t particle_flags_ptr,
+                float margin,
+                float friction_epsilon,
+                float soft_contact_ke,
+                float soft_contact_kd,
+                float soft_contact_mu,
+                std::uintptr_t cuda_stream) {
+
+                 using namespace chysx;
+                 DeviceSpan<math::Vec3f> pos(
+                     reinterpret_cast<math::Vec3f*>(pos_ptr), n_particles);
+                 DeviceSpan<math::Vec3f> vel(
+                     reinterpret_cast<math::Vec3f*>(vel_ptr), n_particles);
+                 DeviceSpan<float> inv_mass(
+                     reinterpret_cast<float*>(inv_mass_ptr), n_particles);
+                 DeviceSpan<math::Vec4i> tet_indices(
+                     reinterpret_cast<math::Vec4i*>(tet_indices_ptr), n_tets);
+                 DeviceSpan<math::Mat3f> tet_poses(
+                     reinterpret_cast<math::Mat3f*>(tet_poses_ptr), n_tets);
+                 DeviceSpan<math::Vec3f> tet_materials(
+                     reinterpret_cast<math::Vec3f*>(tet_materials_ptr), n_tets);
+
+                 self.step_with_collision(
+                     pos, vel, inv_mass,
+                     tet_indices, tet_poses, tet_materials,
+                     math::Vec3f(gx, gy, gz),
+                     dt, iterations,
+                     reinterpret_cast<const float*>(body_q_ptr),
+                     reinterpret_cast<const float*>(body_q_prev_ptr),
+                     n_bodies,
+                     reinterpret_cast<const float*>(particle_radius_ptr),
+                     reinterpret_cast<const int*>(particle_flags_ptr),
+                     margin, friction_epsilon,
+                     soft_contact_ke, soft_contact_kd, soft_contact_mu,
+                     cuda_stream);
+             },
+             py::arg("pos_ptr"),
+             py::arg("vel_ptr"),
+             py::arg("inv_mass_ptr"),
+             py::arg("n_particles"),
+             py::arg("tet_indices_ptr"),
+             py::arg("tet_poses_ptr"),
+             py::arg("tet_materials_ptr"),
+             py::arg("n_tets"),
+             py::arg("gx"), py::arg("gy"), py::arg("gz"),
+             py::arg("dt"),
+             py::arg("iterations"),
+             py::arg("body_q_ptr"),
+             py::arg("body_q_prev_ptr"),
+             py::arg("n_bodies"),
+             py::arg("particle_radius_ptr"),
+             py::arg("particle_flags_ptr"),
+             py::arg("margin"),
+             py::arg("friction_epsilon"),
+             py::arg("soft_contact_ke"),
+             py::arg("soft_contact_kd"),
+             py::arg("soft_contact_mu"),
+             py::arg("cuda_stream") = 0,
+             R"pbdoc(
+Run one VBD substep using ChysX's internal collision pipeline.
+
+Collision detection + material mixing + VBD solve are all performed
+internally, so the caller does not need to run Newton's CollisionPipeline.
+Requires add_collision_shape() + finalize_collision() to have been called.
+)pbdoc")
         .def("step",
              [](chysx::coupled::CoupledSimulator& self,
                 // Particle buffers (device pointers)
@@ -1365,4 +1473,299 @@ Run one VBD substep with optional body-particle contacts.
 All pointer arguments are raw CUDA device pointers (int).
 Contact and body arguments can be 0 (null) to run without coupling.
 )pbdoc");
+
+    // ---- FeatherstoneSolver -----------------------------------------------
+
+    py::class_<chysx::rigid::ArticulationModel>(m, "ArticulationModel", R"pbdoc(
+Model data for articulated rigid bodies (Featherstone solver).
+Constant across timesteps. Populated from Python, then passed to the solver.
+)pbdoc")
+        .def(py::init<>())
+        .def_readwrite("body_count", &chysx::rigid::ArticulationModel::body_count)
+        .def_readwrite("joint_count", &chysx::rigid::ArticulationModel::joint_count)
+        .def_readwrite("articulation_count", &chysx::rigid::ArticulationModel::articulation_count)
+        .def_readwrite("joint_coord_count", &chysx::rigid::ArticulationModel::joint_coord_count)
+        .def_readwrite("joint_dof_count", &chysx::rigid::ArticulationModel::joint_dof_count)
+        .def_readwrite("n_descendant_free_distance", &chysx::rigid::ArticulationModel::n_descendant_free_distance)
+        .def("upload_joint_type", [](chysx::rigid::ArticulationModel& self, py::array_t<int> a) {
+            auto r = a.unchecked<1>();
+            self.joint_type.resize(r.shape(0));
+            std::memcpy(self.joint_type.cpu_data(), r.data(0), r.shape(0) * sizeof(int));
+            self.joint_type.copy_to_device();
+        })
+        .def("upload_joint_parent", [](chysx::rigid::ArticulationModel& self, py::array_t<int> a) {
+            auto r = a.unchecked<1>();
+            self.joint_parent.resize(r.shape(0));
+            std::memcpy(self.joint_parent.cpu_data(), r.data(0), r.shape(0) * sizeof(int));
+            self.joint_parent.copy_to_device();
+        })
+        .def("upload_joint_child", [](chysx::rigid::ArticulationModel& self, py::array_t<int> a) {
+            auto r = a.unchecked<1>();
+            self.joint_child.resize(r.shape(0));
+            std::memcpy(self.joint_child.cpu_data(), r.data(0), r.shape(0) * sizeof(int));
+            self.joint_child.copy_to_device();
+        })
+        .def("upload_joint_q_start", [](chysx::rigid::ArticulationModel& self, py::array_t<int> a) {
+            auto r = a.unchecked<1>();
+            self.joint_q_start.resize(r.shape(0));
+            std::memcpy(self.joint_q_start.cpu_data(), r.data(0), r.shape(0) * sizeof(int));
+            self.joint_q_start.copy_to_device();
+        })
+        .def("upload_joint_qd_start", [](chysx::rigid::ArticulationModel& self, py::array_t<int> a) {
+            auto r = a.unchecked<1>();
+            self.joint_qd_start.resize(r.shape(0));
+            std::memcpy(self.joint_qd_start.cpu_data(), r.data(0), r.shape(0) * sizeof(int));
+            self.joint_qd_start.copy_to_device();
+        })
+        .def("upload_joint_ancestor", [](chysx::rigid::ArticulationModel& self, py::array_t<int> a) {
+            auto r = a.unchecked<1>();
+            self.joint_ancestor.resize(r.shape(0));
+            std::memcpy(self.joint_ancestor.cpu_data(), r.data(0), r.shape(0) * sizeof(int));
+            self.joint_ancestor.copy_to_device();
+        })
+        .def("upload_joint_axis", [](chysx::rigid::ArticulationModel& self,
+                                     py::array_t<float, py::array::c_style> a) {
+            auto r = a.unchecked<2>();
+            int n = r.shape(0);
+            self.joint_axis.resize(n);
+            std::memcpy(self.joint_axis.cpu_data(), r.data(0, 0), n * sizeof(chysx::math::Vec3f));
+            self.joint_axis.copy_to_device();
+        })
+        .def("upload_joint_dof_dim", [](chysx::rigid::ArticulationModel& self, py::array_t<int> a) {
+            auto r = a.unchecked<1>();
+            self.joint_dof_dim.resize(r.shape(0));
+            std::memcpy(self.joint_dof_dim.cpu_data(), r.data(0), r.shape(0) * sizeof(int));
+            self.joint_dof_dim.copy_to_device();
+        })
+        .def("upload_joint_X_p", [](chysx::rigid::ArticulationModel& self,
+                                    py::array_t<float, py::array::c_style> a) {
+            auto r = a.unchecked<2>();
+            int n = r.shape(0);
+            self.joint_X_p.resize(n);
+            std::memcpy(self.joint_X_p.cpu_data(), r.data(0, 0), n * 7 * sizeof(float));
+            self.joint_X_p.copy_to_device();
+        })
+        .def("upload_joint_X_c", [](chysx::rigid::ArticulationModel& self,
+                                    py::array_t<float, py::array::c_style> a) {
+            auto r = a.unchecked<2>();
+            int n = r.shape(0);
+            self.joint_X_c.resize(n);
+            std::memcpy(self.joint_X_c.cpu_data(), r.data(0, 0), n * 7 * sizeof(float));
+            self.joint_X_c.copy_to_device();
+        })
+        .def("upload_body_com", [](chysx::rigid::ArticulationModel& self,
+                                   py::array_t<float, py::array::c_style> a) {
+            auto r = a.unchecked<2>();
+            int n = r.shape(0);
+            self.body_com.resize(n);
+            std::memcpy(self.body_com.cpu_data(), r.data(0, 0), n * sizeof(chysx::math::Vec3f));
+            self.body_com.copy_to_device();
+        })
+        .def("upload_body_inertia", [](chysx::rigid::ArticulationModel& self,
+                                       py::array_t<float, py::array::c_style> a) {
+            auto r = a.unchecked<3>();
+            int n = r.shape(0);
+            self.body_inertia.resize(n);
+            std::memcpy(self.body_inertia.cpu_data(), r.data(0, 0, 0), n * 9 * sizeof(float));
+            self.body_inertia.copy_to_device();
+        })
+        .def("upload_body_mass", [](chysx::rigid::ArticulationModel& self, py::array_t<float> a) {
+            auto r = a.unchecked<1>();
+            int n = r.shape(0);
+            self.body_mass.resize(n);
+            std::memcpy(self.body_mass.cpu_data(), r.data(0), n * sizeof(float));
+            self.body_mass.copy_to_device();
+        })
+        .def("upload_body_flags", [](chysx::rigid::ArticulationModel& self, py::array_t<int> a) {
+            auto r = a.unchecked<1>();
+            int n = r.shape(0);
+            self.body_flags.resize(n);
+            std::memcpy(self.body_flags.cpu_data(), r.data(0), n * sizeof(int));
+            self.body_flags.copy_to_device();
+        })
+        .def("upload_body_world", [](chysx::rigid::ArticulationModel& self, py::array_t<int> a) {
+            auto r = a.unchecked<1>();
+            int n = r.shape(0);
+            self.body_world.resize(n);
+            std::memcpy(self.body_world.cpu_data(), r.data(0), n * sizeof(int));
+            self.body_world.copy_to_device();
+        })
+        .def("upload_joint_target_ke", [](chysx::rigid::ArticulationModel& self, py::array_t<float> a) {
+            auto r = a.unchecked<1>();
+            self.joint_target_ke.resize(r.shape(0));
+            std::memcpy(self.joint_target_ke.cpu_data(), r.data(0), r.shape(0) * sizeof(float));
+            self.joint_target_ke.copy_to_device();
+        })
+        .def("upload_joint_target_kd", [](chysx::rigid::ArticulationModel& self, py::array_t<float> a) {
+            auto r = a.unchecked<1>();
+            self.joint_target_kd.resize(r.shape(0));
+            std::memcpy(self.joint_target_kd.cpu_data(), r.data(0), r.shape(0) * sizeof(float));
+            self.joint_target_kd.copy_to_device();
+        })
+        .def("upload_joint_limit_lower", [](chysx::rigid::ArticulationModel& self, py::array_t<float> a) {
+            auto r = a.unchecked<1>();
+            self.joint_limit_lower.resize(r.shape(0));
+            std::memcpy(self.joint_limit_lower.cpu_data(), r.data(0), r.shape(0) * sizeof(float));
+            self.joint_limit_lower.copy_to_device();
+        })
+        .def("upload_joint_limit_upper", [](chysx::rigid::ArticulationModel& self, py::array_t<float> a) {
+            auto r = a.unchecked<1>();
+            self.joint_limit_upper.resize(r.shape(0));
+            std::memcpy(self.joint_limit_upper.cpu_data(), r.data(0), r.shape(0) * sizeof(float));
+            self.joint_limit_upper.copy_to_device();
+        })
+        .def("upload_joint_limit_ke", [](chysx::rigid::ArticulationModel& self, py::array_t<float> a) {
+            auto r = a.unchecked<1>();
+            self.joint_limit_ke.resize(r.shape(0));
+            std::memcpy(self.joint_limit_ke.cpu_data(), r.data(0), r.shape(0) * sizeof(float));
+            self.joint_limit_ke.copy_to_device();
+        })
+        .def("upload_joint_limit_kd", [](chysx::rigid::ArticulationModel& self, py::array_t<float> a) {
+            auto r = a.unchecked<1>();
+            self.joint_limit_kd.resize(r.shape(0));
+            std::memcpy(self.joint_limit_kd.cpu_data(), r.data(0), r.shape(0) * sizeof(float));
+            self.joint_limit_kd.copy_to_device();
+        })
+        .def("upload_joint_armature", [](chysx::rigid::ArticulationModel& self, py::array_t<float> a) {
+            auto r = a.unchecked<1>();
+            self.joint_armature.resize(r.shape(0));
+            std::memcpy(self.joint_armature.cpu_data(), r.data(0), r.shape(0) * sizeof(float));
+            self.joint_armature.copy_to_device();
+        })
+        .def("upload_articulation_start", [](chysx::rigid::ArticulationModel& self, py::array_t<int> a) {
+            auto r = a.unchecked<1>();
+            self.articulation_start.resize(r.shape(0));
+            std::memcpy(self.articulation_start.cpu_data(), r.data(0), r.shape(0) * sizeof(int));
+            self.articulation_start.copy_to_device();
+        })
+        .def("upload_gravity", [](chysx::rigid::ArticulationModel& self,
+                                  py::array_t<float, py::array::c_style> a) {
+            auto r = a.unchecked<2>();
+            int n = r.shape(0);
+            self.gravity.resize(n);
+            std::memcpy(self.gravity.cpu_data(), r.data(0, 0), n * sizeof(chysx::math::Vec3f));
+            self.gravity.copy_to_device();
+        })
+        .def("sync_gravity_from_ptr", [](chysx::rigid::ArticulationModel& self,
+                                        std::uintptr_t src_ptr, int n_worlds) {
+            cudaMemcpy(self.gravity.gpu_data(), reinterpret_cast<const void*>(src_ptr),
+                       n_worlds * sizeof(chysx::math::Vec3f), cudaMemcpyDeviceToDevice);
+        })
+        .def("upload_descendant_info", [](chysx::rigid::ArticulationModel& self,
+                                          py::array_t<int> indices,
+                                          py::array_t<int> art_ids,
+                                          py::array_t<int> joint_starts) {
+            auto ri = indices.unchecked<1>();
+            auto ra = art_ids.unchecked<1>();
+            auto rj = joint_starts.unchecked<1>();
+            int n = ri.shape(0);
+            self.n_descendant_free_distance = n;
+            if (n > 0) {
+                self.descendant_free_distance_joint_indices.resize(n);
+                std::memcpy(self.descendant_free_distance_joint_indices.cpu_data(), ri.data(0), n * sizeof(int));
+                self.descendant_free_distance_joint_indices.copy_to_device();
+                self.descendant_free_distance_articulation_ids.resize(n);
+                std::memcpy(self.descendant_free_distance_articulation_ids.cpu_data(), ra.data(0), n * sizeof(int));
+                self.descendant_free_distance_articulation_ids.copy_to_device();
+                self.descendant_free_distance_joint_starts.resize(n);
+                std::memcpy(self.descendant_free_distance_joint_starts.cpu_data(), rj.data(0), n * sizeof(int));
+                self.descendant_free_distance_joint_starts.copy_to_device();
+            }
+        });
+
+    py::class_<chysx::rigid::ArticulationState>(m, "ArticulationState", R"pbdoc(
+Per-timestep state for Featherstone solver.
+)pbdoc")
+        .def(py::init<>())
+        .def("allocate", [](chysx::rigid::ArticulationState& self,
+                            int joint_coord_count, int joint_dof_count) {
+            self.joint_q.resize(joint_coord_count);
+            self.joint_qd.resize(joint_dof_count);
+        })
+        .def("upload_joint_q", [](chysx::rigid::ArticulationState& self, std::uintptr_t src_ptr, int n) {
+            cudaMemcpy(self.joint_q.gpu_data(), reinterpret_cast<const void*>(src_ptr),
+                       n * sizeof(float), cudaMemcpyDeviceToDevice);
+        })
+        .def("upload_joint_qd", [](chysx::rigid::ArticulationState& self, std::uintptr_t src_ptr, int n) {
+            cudaMemcpy(self.joint_qd.gpu_data(), reinterpret_cast<const void*>(src_ptr),
+                       n * sizeof(float), cudaMemcpyDeviceToDevice);
+        })
+        .def("joint_q_ptr", [](chysx::rigid::ArticulationState& self) -> std::uintptr_t {
+            return reinterpret_cast<std::uintptr_t>(self.joint_q.gpu_data());
+        })
+        .def("joint_qd_ptr", [](chysx::rigid::ArticulationState& self) -> std::uintptr_t {
+            return reinterpret_cast<std::uintptr_t>(self.joint_qd.gpu_data());
+        })
+        .def("copy_joint_q_to", [](chysx::rigid::ArticulationState& self, std::uintptr_t dst_ptr, int n) {
+            if (n > 0 && self.joint_q.gpu_data()) {
+                cudaMemcpy(reinterpret_cast<void*>(dst_ptr), self.joint_q.gpu_data(),
+                           n * sizeof(float), cudaMemcpyDeviceToDevice);
+            }
+        })
+        .def("copy_joint_qd_to", [](chysx::rigid::ArticulationState& self, std::uintptr_t dst_ptr, int n) {
+            if (n > 0 && self.joint_qd.gpu_data()) {
+                cudaMemcpy(reinterpret_cast<void*>(dst_ptr), self.joint_qd.gpu_data(),
+                           n * sizeof(float), cudaMemcpyDeviceToDevice);
+            }
+        });
+
+    py::class_<chysx::rigid::FeatherstoneSolver>(m, "FeatherstoneSolver", R"pbdoc(
+Featherstone articulated rigid body solver (CRBA + Cholesky).
+Port of Newton's SolverFeatherstone to C++/CUDA.
+)pbdoc")
+        .def(py::init<>())
+        .def("set_model", &chysx::rigid::FeatherstoneSolver::set_model,
+             py::arg("model"),
+             "Initialize solver from ArticulationModel (copies to GPU).")
+        .def("step",
+             [](chysx::rigid::FeatherstoneSolver& self,
+                chysx::rigid::ArticulationState& state_in,
+                chysx::rigid::ArticulationState& state_out,
+                std::uintptr_t target_pos_ptr,
+                std::uintptr_t target_vel_ptr,
+                std::uintptr_t joint_f_ptr,
+                std::uintptr_t body_f_ext_ptr,
+                float dt,
+                std::uintptr_t cuda_stream) {
+                 chysx::rigid::FeatherstoneSolver::ControlInputs ctrl;
+                 ctrl.joint_target_pos = reinterpret_cast<float*>(target_pos_ptr);
+                 ctrl.joint_target_vel = reinterpret_cast<float*>(target_vel_ptr);
+                 ctrl.joint_f = reinterpret_cast<float*>(joint_f_ptr);
+                 self.step(state_in, state_out, ctrl,
+                           reinterpret_cast<float*>(body_f_ext_ptr),
+                           dt, cuda_stream);
+             },
+             py::arg("state_in"),
+             py::arg("state_out"),
+             py::arg("target_pos_ptr"),
+             py::arg("target_vel_ptr"),
+             py::arg("joint_f_ptr"),
+             py::arg("body_f_ext_ptr"),
+             py::arg("dt"),
+             py::arg("cuda_stream") = 0,
+             R"pbdoc(
+Run one Featherstone step. All pointer arguments are raw CUDA device pointers (int).
+)pbdoc")
+        .def("body_q_ptr", [](chysx::rigid::FeatherstoneSolver& self) -> std::uintptr_t {
+            return reinterpret_cast<std::uintptr_t>(self.body_q_ptr());
+        })
+        .def("body_qd_ptr", [](chysx::rigid::FeatherstoneSolver& self) -> std::uintptr_t {
+            return reinterpret_cast<std::uintptr_t>(self.body_qd_ptr());
+        })
+        .def("copy_body_q_to", [](chysx::rigid::FeatherstoneSolver& self, std::uintptr_t dst_ptr) {
+            int n = self.body_count();
+            if (n > 0 && self.body_q_ptr()) {
+                cudaMemcpy(reinterpret_cast<void*>(dst_ptr), self.body_q_ptr(),
+                           n * 7 * sizeof(float), cudaMemcpyDeviceToDevice);
+            }
+        })
+        .def("copy_body_qd_to", [](chysx::rigid::FeatherstoneSolver& self, std::uintptr_t dst_ptr) {
+            int n = self.body_count();
+            if (n > 0 && self.body_qd_ptr()) {
+                cudaMemcpy(reinterpret_cast<void*>(dst_ptr), self.body_qd_ptr(),
+                           n * 6 * sizeof(float), cudaMemcpyDeviceToDevice);
+            }
+        })
+        .def("body_count", &chysx::rigid::FeatherstoneSolver::body_count)
+        .def("joint_count", &chysx::rigid::FeatherstoneSolver::joint_count);
 }

@@ -38,13 +38,19 @@ from . import _chysx_native
 ClothMaterial = _chysx_native.ClothMaterial
 ClothSimulator = _chysx_native.ClothSimulator
 CoupledSimulator = _chysx_native.CoupledSimulator
+ArticulationModel = _chysx_native.ArticulationModel
+ArticulationState = _chysx_native.ArticulationState
+FeatherstoneSolver = _chysx_native.FeatherstoneSolver
 
 __version__ = "0.1.0"
 
 
 __all__ = [
+    "ArticulationModel",
+    "ArticulationState",
     "ClothMaterial",
     "ClothSimulator",
     "CoupledSimulator",
+    "FeatherstoneSolver",
     "__version__",
 ]

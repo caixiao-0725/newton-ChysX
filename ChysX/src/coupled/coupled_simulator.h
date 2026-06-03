@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "../collision/collision_pipeline.h"
 #include "../math/matrix.cuh"
 #include "../math/vec.cuh"
 #include "../memory/cuda_array.h"
@@ -105,13 +106,47 @@ public:
         float friction_epsilon,
         std::uintptr_t cuda_stream = 0);
 
+    // ---- collision pipeline (ChysX-native) ----------------------------
+
+    void add_collision_shape(int body, int geo_type,
+                             float sx, float sy, float sz,
+                             const float* local_tf_7, int flags,
+                             uint64_t mesh_id,
+                             float mat_ke, float mat_kd, float mat_mu);
+
+    void finalize_collision(int max_soft_contacts = 0);
+
+    void step_with_collision(
+        DeviceSpan<math::Vec3f> pos,
+        DeviceSpan<math::Vec3f> vel,
+        DeviceSpan<float> inv_mass,
+        DeviceSpan<math::Vec4i> tet_indices,
+        DeviceSpan<math::Mat3f> tet_poses,
+        DeviceSpan<math::Vec3f> tet_materials,
+        math::Vec3f gravity,
+        float dt,
+        int iterations,
+        const float* body_q,
+        const float* body_q_prev,
+        int n_bodies,
+        const float* particle_radius,
+        const int*   particle_flags,
+        float margin,
+        float friction_epsilon,
+        float soft_contact_ke,
+        float soft_contact_kd,
+        float soft_contact_mu,
+        std::uintptr_t cuda_stream);
+
     // ---- accessors ---------------------------------------------------
 
     int num_colors() const noexcept { return vbd_.num_colors(); }
     solver::VBDSolver& vbd() noexcept { return vbd_; }
+    collision::CollisionPipeline& collision_pipeline() noexcept { return collision_; }
 
 private:
     solver::VBDSolver vbd_;
+    collision::CollisionPipeline collision_;
 
     // Per-particle force/hessian accumulators for contacts
     CudaArray<math::Vec3f> particle_forces_;

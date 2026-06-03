@@ -36,6 +36,11 @@ class SolverChysXCoupled(SolverBase):
         model: Newton ``Model`` with particles and (optionally) rigid bodies.
         iterations: VBD Gauss-Seidel iterations per substep.
         friction_epsilon: IPC friction regularisation velocity [m/s].
+        use_native_collision: If True, register shapes from the model
+            and use ChysX's internal collision pipeline instead of
+            Newton's ``CollisionPipeline``.  Pass ``contacts=None``
+            in :meth:`step` to activate.
+        soft_contact_margin: Collision margin [m] for native pipeline.
     """
 
     def __init__(
@@ -43,6 +48,8 @@ class SolverChysXCoupled(SolverBase):
         model: Model,
         iterations: int = 5,
         friction_epsilon: float = 1e-2,
+        use_native_collision: bool = False,
+        soft_contact_margin: float = 0.01,
     ):
         super().__init__(model=model)
 
@@ -57,6 +64,8 @@ class SolverChysXCoupled(SolverBase):
         self._device = wp.get_device(str(model.device))
         self._iterations = iterations
         self._friction_epsilon = friction_epsilon
+        self._use_native_collision = use_native_collision
+        self._soft_contact_margin = soft_contact_margin
 
         g_np = model.gravity.numpy().reshape(-1, 3)[0]
         self._gravity = (float(g_np[0]), float(g_np[1]), float(g_np[2]))
@@ -75,8 +84,6 @@ class SolverChysXCoupled(SolverBase):
             self._mats_np = np.ascontiguousarray(tet_mat_raw)
             self._n_tets = int(self._tets_np.shape[0])
 
-            # Use Newton's coloring when available so that VBD sweep order
-            # matches the reference SolverVBD exactly.
             if hasattr(model, "particle_colors") and model.particle_colors is not None:
                 newton_colors = model.particle_colors.numpy().astype(np.int32)
                 self._sim.set_coloring(
@@ -95,9 +102,6 @@ class SolverChysXCoupled(SolverBase):
             self._tet_poses_wp = None
             self._tet_materials_wp = None
 
-        # VBD color assignment per particle (device array for the kernel).
-        # When Newton's coloring was imported via set_coloring, use it
-        # directly instead of rebuilding a (different) greedy coloring.
         if hasattr(model, "particle_colors") and model.particle_colors is not None:
             self._particle_colors_wp = wp.array(
                 model.particle_colors.numpy().astype(np.int32),
@@ -112,6 +116,9 @@ class SolverChysXCoupled(SolverBase):
         self._contact_material_kd: wp.array | None = None
         self._contact_material_mu: wp.array | None = None
         self._last_contact_max: int = 0
+
+        if use_native_collision:
+            self._register_collision_shapes(model)
 
     def _build_tet_poses(self, model: Model) -> None:
         """Compute Dm_inv for each tet from rest positions."""
@@ -186,6 +193,50 @@ class SolverChysXCoupled(SolverBase):
             np.array(colors, dtype=np.int32), dtype=wp.int32, device=self._device
         )
 
+    def _register_collision_shapes(self, model: Model) -> None:
+        """Register all shapes from the model into ChysX's collision pipeline."""
+        shape_body_np = model.shape_body.numpy() if model.shape_body is not None else np.zeros(0, dtype=np.int32)
+        shape_type_np = model.shape_type.numpy() if model.shape_type is not None else np.zeros(0, dtype=np.int32)
+        shape_scale_np = model.shape_scale.numpy().reshape(-1, 3) if model.shape_scale is not None else np.zeros((0, 3), dtype=np.float32)
+        shape_transform_np = model.shape_transform.numpy().reshape(-1, 7) if model.shape_transform is not None else np.zeros((0, 7), dtype=np.float32)
+        shape_flags_np = model.shape_flags.numpy() if hasattr(model, "shape_flags") and model.shape_flags is not None else np.zeros(0, dtype=np.int32)
+
+        has_source_ptr = hasattr(model, "shape_source_ptr") and model.shape_source_ptr is not None
+        source_ptr_np = model.shape_source_ptr.numpy() if has_source_ptr else np.zeros(0, dtype=np.uint64)
+
+        mat_ke_np = model.shape_material_ke.numpy() if hasattr(model, "shape_material_ke") and model.shape_material_ke is not None else np.zeros(0, dtype=np.float32)
+        mat_kd_np = model.shape_material_kd.numpy() if hasattr(model, "shape_material_kd") and model.shape_material_kd is not None else np.zeros(0, dtype=np.float32)
+        mat_mu_np = model.shape_material_mu.numpy() if hasattr(model, "shape_material_mu") and model.shape_material_mu is not None else np.zeros(0, dtype=np.float32)
+
+        for i in range(model.shape_count):
+            body = int(shape_body_np[i]) if i < len(shape_body_np) else -1
+            geo_type = int(shape_type_np[i]) if i < len(shape_type_np) else 0
+            scale = shape_scale_np[i].astype(np.float32) if i < len(shape_scale_np) else np.zeros(3, dtype=np.float32)
+            tf = np.ascontiguousarray(shape_transform_np[i].astype(np.float32)) if i < len(shape_transform_np) else np.zeros(7, dtype=np.float32)
+            flags = int(shape_flags_np[i]) if i < len(shape_flags_np) else 0
+            mesh_id = int(source_ptr_np[i]) if has_source_ptr and i < len(source_ptr_np) else 0
+
+            m_ke = float(mat_ke_np[i]) if i < len(mat_ke_np) else 0.0
+            m_kd = float(mat_kd_np[i]) if i < len(mat_kd_np) else 0.0
+            m_mu = float(mat_mu_np[i]) if i < len(mat_mu_np) else 0.0
+
+            self._sim.add_collision_shape(
+                body=body,
+                geo_type=geo_type,
+                sx=float(scale[0]),
+                sy=float(scale[1]),
+                sz=float(scale[2]),
+                local_tf=tf,
+                flags=flags,
+                mesh_id=mesh_id,
+                mat_ke=m_ke,
+                mat_kd=m_kd,
+                mat_mu=m_mu,
+            )
+
+        max_soft_contacts = model.particle_count * 4 if model.particle_count > 0 else 64 * 1024
+        self._sim.finalize_collision(max_soft_contacts)
+
     def _ensure_contact_buffers(self, max_contacts: int) -> None:
         """Allocate/resize per-contact AVBD arrays."""
         if max_contacts <= self._last_contact_max:
@@ -226,7 +277,76 @@ class SolverChysXCoupled(SolverBase):
         model = self.model
         gx, gy, gz = self._gravity
 
-        # Prepare contact data pointers
+        # Native collision path: contacts=None + use_native_collision
+        if contacts is None and self._use_native_collision:
+            self._step_native_collision(state_in, state_out, dt, stream)
+            return
+
+        # External contacts path (Newton CollisionPipeline)
+        self._step_external_contacts(state_in, state_out, contacts, dt, stream)
+
+    def _step_native_collision(
+        self, state_in: State, state_out: State, dt: float, stream: int,
+    ) -> None:
+        """VBD step with ChysX-internal collision detection."""
+        model = self.model
+        n = model.particle_count
+        gx, gy, gz = self._gravity
+
+        body_q_ptr = 0
+        body_q_prev_ptr = 0
+        n_bodies = 0
+        if model.body_count > 0:
+            body_q_ptr = state_out.body_q.ptr
+            body_q_prev_ptr = state_in.body_q.ptr
+            n_bodies = model.body_count
+
+        particle_radius_ptr = 0
+        if model.particle_radius is not None:
+            particle_radius_ptr = model.particle_radius.ptr
+
+        particle_flags_ptr = 0
+        if hasattr(model, "particle_flags") and model.particle_flags is not None:
+            particle_flags_ptr = model.particle_flags.ptr
+
+        self._sim.step_with_collision(
+            pos_ptr=state_out.particle_q.ptr,
+            vel_ptr=state_out.particle_qd.ptr,
+            inv_mass_ptr=model.particle_inv_mass.ptr,
+            n_particles=n,
+            tet_indices_ptr=self._tet_indices_wp.ptr if self._tet_indices_wp is not None else 0,
+            tet_poses_ptr=self._tet_poses_wp.ptr if self._tet_poses_wp is not None else 0,
+            tet_materials_ptr=self._tet_materials_wp.ptr if self._tet_materials_wp is not None else 0,
+            n_tets=self._n_tets,
+            gx=gx, gy=gy, gz=gz,
+            dt=float(dt),
+            iterations=self._iterations,
+            body_q_ptr=body_q_ptr,
+            body_q_prev_ptr=body_q_prev_ptr,
+            n_bodies=n_bodies,
+            particle_radius_ptr=particle_radius_ptr,
+            particle_flags_ptr=particle_flags_ptr,
+            margin=self._soft_contact_margin,
+            friction_epsilon=self._friction_epsilon,
+            soft_contact_ke=float(model.soft_contact_ke),
+            soft_contact_kd=float(model.soft_contact_kd),
+            soft_contact_mu=float(model.soft_contact_mu),
+            cuda_stream=stream,
+        )
+
+    def _step_external_contacts(
+        self,
+        state_in: State,
+        state_out: State,
+        contacts: Contacts | None,
+        dt: float,
+        stream: int,
+    ) -> None:
+        """VBD step with externally-provided contacts (Newton CollisionPipeline)."""
+        model = self.model
+        n = model.particle_count
+        gx, gy, gz = self._gravity
+
         contact_particle_ptr = 0
         contact_count_ptr = 0
         contact_max = 0
