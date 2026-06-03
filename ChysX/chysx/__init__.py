@@ -37,12 +37,32 @@ from . import _chysx_native
 
 ClothMaterial = _chysx_native.ClothMaterial
 ClothSimulator = _chysx_native.ClothSimulator
+CoupledSimulator = _chysx_native.CoupledSimulator
+ArticulationModel = _chysx_native.ArticulationModel
+ArticulationState = _chysx_native.ArticulationState
+FeatherstoneSolver = _chysx_native.FeatherstoneSolver
+IKSolver = _chysx_native.IKSolver
+IKConfig = _chysx_native.IKConfig
+IKObjectiveDesc = _chysx_native.IKObjectiveDesc
+IKOptimizerType = _chysx_native.IKOptimizerType
+IKSamplerType = _chysx_native.IKSamplerType
+IKObjectiveType = _chysx_native.IKObjectiveType
 
 __version__ = "0.1.0"
 
 
 __all__ = [
+    "ArticulationModel",
+    "ArticulationState",
     "ClothMaterial",
     "ClothSimulator",
+    "CoupledSimulator",
+    "FeatherstoneSolver",
+    "IKConfig",
+    "IKObjectiveDesc",
+    "IKObjectiveType",
+    "IKOptimizerType",
+    "IKSamplerType",
+    "IKSolver",
     "__version__",
 ]

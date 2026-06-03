@@ -2,5 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from .solver_chysx import SolverChysX
+from .solver_chysx_coupled import SolverChysXCoupled
+from .solver_chysx_featherstone import SolverChysXFeatherstone
+from .solver_chysx_ik import SolverChysXIK
 
-__all__ = ["SolverChysX"]
+__all__ = ["SolverChysX", "SolverChysXCoupled", "SolverChysXFeatherstone", "SolverChysXIK"]

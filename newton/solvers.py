@@ -403,6 +403,9 @@ See the `DiffSim examples on GitHub`_ for the current reference workflows.
 from ._src.solvers import (
     SolverBase,
     SolverChysX,
+    SolverChysXCoupled,
+    SolverChysXFeatherstone,
+    SolverChysXIK,
     SolverFeatherstone,
     SolverImplicitMPM,
     SolverKamino,
@@ -420,6 +423,9 @@ from ._src.solvers.flags import SolverNotifyFlags
 __all__ = [
     "SolverBase",
     "SolverChysX",
+    "SolverChysXCoupled",
+    "SolverChysXFeatherstone",
+    "SolverChysXIK",
     "SolverFeatherstone",
     "SolverImplicitMPM",
     "SolverKamino",

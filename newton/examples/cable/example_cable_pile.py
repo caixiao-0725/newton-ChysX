@@ -28,7 +28,7 @@ class Example:
         slope_enabled: bool = False,
         slope_angle_deg: float = 20.0,
         slope_mu: float | None = None,
-        layers: int = 10,
+        layers: int = 40,
         lanes_per_layer: int = 10,
     ):
         self.viewer = viewer
@@ -184,13 +184,8 @@ class Example:
         self.capture()
 
     def capture(self):
-        """Capture simulation loop into a CUDA graph for optimal GPU performance."""
-        if wp.get_device().is_cuda:
-            with wp.ScopedCapture() as cap:
-                self.simulate()
-            self.graph = cap.graph
-        else:
-            self.graph = None
+        """Disable CUDA graph capture for easier debugging and compatibility."""
+        self.graph = None
 
     def simulate(self):
         """Execute all simulation substeps for one frame."""

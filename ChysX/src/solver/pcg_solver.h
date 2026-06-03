@@ -44,14 +44,14 @@
 // solver never copies them back to the host inside the iteration so a
 // full solve runs without host-device synchronisation.
 //
-// Stream usage
-// ------------
-// Every kernel the solve issues is dispatched onto the
-// caller-supplied `cuda_stream`.  No internal stream is created and
-// no synchronisation is performed against any other stream.  Callers
-// who want CUDA Graph capture should wrap `solve()` in their own
-// `wp.ScopedCapture` / `cudaStreamBeginCapture` block — every PCG
-// kernel will be recorded as a node in that outer graph automatically.
+// CUDA Graph
+// ----------
+// The entire solve (setup + iteration loop) is captured into a CUDA
+// Graph on the first call and replayed on subsequent calls.  Because
+// all device pointers (workspace buffers, CSR topology arrays, x, b)
+// are stable across frames the graph stays valid without per-frame
+// updates.  The graph is invalidated and re-captured when the problem
+// size (`n`) or iteration count (`max_iterations`) changes.
 
 #pragma once
 
@@ -69,11 +69,15 @@
 // `cudaStream_t` (which is `CUstream_st*`) at call sites.
 struct CUstream_st;
 
+// Forward-declare CUDA Graph types to avoid pulling <cuda_runtime.h>
+// into every translation unit that includes this header.
+struct CUgraphExec_st;
+
 namespace chysx {
 namespace solver {
 
 struct PCGParams {
-    int max_iterations = 100;
+    int max_iterations = 50;
 };
 
 class PCGSolver {
@@ -83,10 +87,10 @@ public:
     PCGSolver(const PCGSolver&) = delete;
     PCGSolver& operator=(const PCGSolver&) = delete;
 
-    PCGSolver(PCGSolver&& other) noexcept = default;
-    PCGSolver& operator=(PCGSolver&& other) noexcept = default;
+    PCGSolver(PCGSolver&& other) noexcept;
+    PCGSolver& operator=(PCGSolver&& other) noexcept;
 
-    ~PCGSolver() = default;
+    ~PCGSolver();
 
     // Allocate (or reuse) workspace for `num_block_rows` particles.
     // Idempotent: if the size already matches no allocation happens.
@@ -104,13 +108,19 @@ public:
     //       behaviour, or leave the previous solve's result in place
     //       to warm-start.
     //
-    // `contact` (optional) attaches a dynamic COO-style additive
-    // operator to the system: every `A * x` evaluation inside the
-    // iteration becomes `(A + C) * x`, where C reads the contact
-    // pairs/weights from `*contact`.  The static CSR topology of A
-    // is therefore never modified by collision -- contact churn
-    // between frames is absorbed entirely by the COO sidecar.  Pass
-    // `nullptr` (default) to recover the plain `A x = b` solver.
+    // `contact` attaches a dynamic COO-style additive operator to the
+    // system: every `A * x` evaluation inside the iteration becomes
+    // `(A + C) * x`, where C reads the contact pairs/weights from
+    // `contact`.  The static CSR topology of A is therefore never
+    // modified by collision -- contact churn between frames is
+    // absorbed entirely by the COO sidecar.  Pass a default-
+    // constructed (inactive) op to recover the plain `A x = b`
+    // solver.
+    //
+    // The contact SpMV kernel is launched unconditionally (even when
+    // `contact.active() == false`) so that the kernel sequence is
+    // identical regardless of whether contacts exist -- this keeps
+    // a surrounding CUDA Graph capture valid across frames.
     //
     // Returns the number of iterations actually performed.
     int solve(const sparse::BlockCSR3& A,
@@ -118,7 +128,7 @@ public:
               DeviceSpan<math::Vec3f> x,
               const PCGParams& params = PCGParams{},
               std::uintptr_t cuda_stream = 0,
-              const collision::ContactSpMVOp* contact = nullptr);
+              collision::ContactSpMVOp contact = {});
 
     // Last solve's preconditioner-weighted residual <r, z> from the
     // final iteration, copied to host on demand.  Useful for cheap
@@ -126,6 +136,8 @@ public:
     float last_residual();
 
 private:
+    void destroy_graph() noexcept;
+
     int num_block_rows_ = 0;
 
     CudaArray<math::Vec3f> r_;
@@ -142,6 +154,16 @@ private:
     //   coeff_[2] = <r, z>_new  (rho_{k+1})
     //   coeff_[3] = scratch
     CudaArray<float> coeff_;
+
+    // CUDA Graph cache.  The graph is captured on the first solve and
+    // replayed on subsequent calls.  Invalidated when the problem size
+    // or iteration count changes.  `graph_stream_` is a dedicated
+    // non-default stream because CUDA does not support graph capture on
+    // the legacy default stream (stream 0 / NULL).
+    CUstream_st* graph_stream_ = nullptr;
+    CUgraphExec_st* graph_exec_ = nullptr;
+    int graph_n_ = 0;
+    int graph_max_iter_ = 0;
 };
 
 }  // namespace solver

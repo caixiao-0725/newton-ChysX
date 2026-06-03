@@ -160,9 +160,9 @@ void BlockCSR3::set_zero(std::uintptr_t cuda_stream) {
                                    nnz_off * sizeof(math::Mat3f), stream),
                    "cudaMemsetAsync(values)");
     }
-    if (cuda_stream == 0) {
-        check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
-    }
+    //if (cuda_stream == 0) {
+    //    check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
+    //}
 }
 
 void BlockCSR3::resolve_slots(const int* host_rows,
@@ -237,9 +237,9 @@ void spmv(const BlockCSR3& A,
         y.data(),
         alpha, beta);
 
-    if (cuda_stream == 0) {
-        check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
-    }
+    //if (cuda_stream == 0) {
+    //    check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
+    //}
 }
 
 }  // namespace sparse

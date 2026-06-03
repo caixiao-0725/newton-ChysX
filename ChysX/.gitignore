@@ -1,8 +1,11 @@
 # scikit-build-core / CMake build outputs
 build/
+build_viewer/
 _skbuild/
 dist/
 wheels/
+assets/output/
+chysx/
 *.egg-info
 
 # Native build artefacts (Windows + Linux + macOS)

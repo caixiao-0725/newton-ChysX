@@ -275,10 +275,10 @@ void BendingConstraint::set_dihedrals_from_positions(
         rest_angles_.gpu_data(),
         n);
 
-    if (cuda_stream == 0) {
-        check_cuda(cudaStreamSynchronize(stream),
-                   "cudaStreamSynchronize after bending_rest_angle_kernel");
-    }
+    //if (cuda_stream == 0) {
+    //    check_cuda(cudaStreamSynchronize(stream),
+    //               "cudaStreamSynchronize after bending_rest_angle_kernel");
+    //}
 }
 
 float BendingConstraint::compute_energy(DeviceSpan<math::Vec3f> positions,
@@ -322,9 +322,9 @@ void BendingConstraint::accumulate_gradient(DeviceSpan<math::Vec3f> positions,
         out_grad.data(),
         n);
 
-    if (cuda_stream == 0) {
-        check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
-    }
+    //if (cuda_stream == 0) {
+    //    check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
+    //}
 }
 
 void BendingConstraint::accumulate_hessian(DeviceSpan<math::Vec3f> positions,
@@ -349,9 +349,9 @@ void BendingConstraint::accumulate_hessian(DeviceSpan<math::Vec3f> positions,
         A.values.gpu_data(),
         n);
 
-    if (cuda_stream == 0) {
-        check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
-    }
+    //if (cuda_stream == 0) {
+    //    check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
+    //}
 }
 
 }  // namespace constraint
