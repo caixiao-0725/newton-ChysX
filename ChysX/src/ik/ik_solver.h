@@ -137,6 +137,16 @@ private:
     CudaArray<float> roberts_basis_;         // [n_coords] or empty
     uint32_t rng_counter_ = 0;
 
+    // Active stream for kernel launches (set during step/graph capture)
+    cudaStream_t stream_ = nullptr;
+
+    // CUDA Graph for LM solve
+    cudaGraph_t lm_graph_ = nullptr;
+    cudaGraphExec_t lm_graph_exec_ = nullptr;
+    int lm_graph_iters_ = 0;
+    float lm_graph_step_size_ = 0;
+    bool lm_graph_valid_ = false;
+
     // Helpers
     void sample_(const float* joint_q_in);
     void lm_step_(float* joint_q, float step_size, int iteration);
@@ -148,6 +158,8 @@ private:
     void compute_jacobian_(const float* joint_q, const float* body_q, int n_batch_actual);
     void compute_costs_(const float* residuals, float* costs_out, int n_batch_actual);
     void integrate_dq_(const float* joint_q_curr, const float* dq, float dt, float* joint_q_out, int n_batch_actual);
+
+    void lm_record_graph_(int iterations, float step_size);
 
     // L-BFGS line search helpers
     void lbfgs_gradient_(const float* joint_q, float* gradient_out, int n_batch_actual);

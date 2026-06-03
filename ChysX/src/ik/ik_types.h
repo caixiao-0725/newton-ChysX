@@ -65,6 +65,9 @@ struct IKConfig {
     // Sampling parameters
     float noise_std = 0.1f;
     uint32_t rng_seed = 12345;
+
+    // Convergence tolerance for early termination (0 = disabled)
+    float convergence_tol = 0.0f;
 };
 
 }  // namespace ik

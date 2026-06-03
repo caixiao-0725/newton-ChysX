@@ -42,8 +42,9 @@ class SolverChysXIK:
         n_seeds: int = 1,
         sampler: str = "none",
         lambda_initial: float = 0.1,
-        iterations: int = 24,
+        iterations: int = 12,
         step_size: float = 1.0,
+        convergence_tol: float = 0.0,
         **kwargs,
     ):
         import chysx
@@ -74,6 +75,7 @@ class SolverChysXIK:
         cfg.iterations = iterations
         cfg.step_size = step_size
         cfg.lambda_initial = lambda_initial
+        cfg.convergence_tol = convergence_tol
 
         for k, v in kwargs.items():
             if hasattr(cfg, k):

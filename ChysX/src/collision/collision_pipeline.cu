@@ -325,7 +325,11 @@ void CollisionPipeline::collide(
                sizeof(int), stream), "zero contact count");
 
     const int n_shapes = shapes_gpu_.count;
-    const int n_launch = n_particles * n_shapes;
+    const long long n_launch_ll = (long long)n_particles * n_shapes;
+    if (n_launch_ll > INT_MAX || n_launch_ll <= 0) {
+        return;
+    }
+    const int n_launch = (int)n_launch_ll;
     constexpr int block = 256;
     const int grid = (n_launch + block - 1) / block;
 

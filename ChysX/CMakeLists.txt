@@ -1,4 +1,9 @@
 cmake_minimum_required(VERSION 3.18)
+
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES "native" CACHE STRING "CUDA architectures")
+endif()
+
 project(chysx LANGUAGES CXX CUDA)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)

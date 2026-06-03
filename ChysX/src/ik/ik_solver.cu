@@ -289,7 +289,7 @@ void IKSolver::compute_fk_(const float* joint_q, float* body_q_out, int n_batch_
     int total = n_batch_actual * joint_count_;
     int grid = div_up(total, kBlockSize);
 
-    ik_fk_local_kernel<<<grid, kBlockSize>>>(
+    ik_fk_local_kernel<<<grid, kBlockSize, 0, stream_>>>(
         n_batch_actual, joint_count_,
         model_->joint_type.gpu_data(),
         joint_q,
@@ -302,7 +302,7 @@ void IKSolver::compute_fk_(const float* joint_q, float* body_q_out, int n_batch_
         n_coords_,
         X_local_.gpu_data());
 
-    ik_fk_accum_kernel<<<grid, kBlockSize>>>(
+    ik_fk_accum_kernel<<<grid, kBlockSize, 0, stream_>>>(
         n_batch_actual, joint_count_,
         model_->joint_parent.gpu_data(),
         X_local_.gpu_data(),
@@ -317,9 +317,8 @@ void IKSolver::compute_motion_subspace_(const float* body_q, int n_batch_actual)
     int total = n_batch_actual * joint_count_;
     int grid = div_up(total, kBlockSize);
 
-    cudaMemset(joint_qd_zero_.gpu_data(), 0, n_batch_actual * n_dofs_ * sizeof(float));
-
-    ik_motion_subspace_kernel<<<grid, kBlockSize>>>(
+    // joint_qd_zero_ is zeroed once in finalize() and never written to
+    ik_motion_subspace_kernel<<<grid, kBlockSize, 0, stream_>>>(
         n_batch_actual, joint_count_, n_dofs_,
         model_->joint_type.gpu_data(),
         model_->joint_parent.gpu_data(),
@@ -338,7 +337,8 @@ void IKSolver::compute_motion_subspace_(const float* body_q, int n_batch_actual)
 
 void IKSolver::compute_residuals_(const float* joint_q, const float* body_q,
                                    float* residuals_out, int n_batch_actual) {
-    cudaMemset(residuals_out, 0, n_batch_actual * n_residuals_ * sizeof(float));
+    int zero_n = n_batch_actual * n_residuals_;
+    ik_zero_float_kernel<<<div_up(zero_n, kBlockSize), kBlockSize, 0, stream_>>>(zero_n, residuals_out);
 
     for (size_t i = 0; i < obj_data_.size(); ++i) {
         auto& od = obj_data_[i];
@@ -346,7 +346,7 @@ void IKSolver::compute_residuals_(const float* joint_q, const float* body_q,
 
         if (od.desc.type == IKObjectiveType::POSITION) {
             int grid = div_up(n_batch_actual, kBlockSize);
-            ik_pos_residuals_kernel<<<grid, kBlockSize>>>(
+            ik_pos_residuals_kernel<<<grid, kBlockSize, 0, stream_>>>(
                 n_batch_actual, n_residuals_,
                 body_q, od.target_positions.gpu_data(),
                 problem_idx_.gpu_data(),
@@ -356,7 +356,7 @@ void IKSolver::compute_residuals_(const float* joint_q, const float* body_q,
 
         } else if (od.desc.type == IKObjectiveType::ROTATION) {
             int grid = div_up(n_batch_actual, kBlockSize);
-            ik_rot_residuals_kernel<<<grid, kBlockSize>>>(
+            ik_rot_residuals_kernel<<<grid, kBlockSize, 0, stream_>>>(
                 n_batch_actual, n_residuals_,
                 body_q, od.target_rotations.gpu_data(),
                 problem_idx_.gpu_data(),
@@ -368,7 +368,7 @@ void IKSolver::compute_residuals_(const float* joint_q, const float* body_q,
         } else if (od.desc.type == IKObjectiveType::JOINT_LIMIT) {
             int total = n_batch_actual * n_dofs_;
             int grid = div_up(total, kBlockSize);
-            ik_limit_residuals_kernel<<<grid, kBlockSize>>>(
+            ik_limit_residuals_kernel<<<grid, kBlockSize, 0, stream_>>>(
                 n_batch_actual, n_dofs_, n_residuals_, n_coords_,
                 joint_q,
                 model_->joint_limit_lower.gpu_data(),
@@ -385,7 +385,8 @@ void IKSolver::compute_residuals_(const float* joint_q, const float* body_q,
 // ============================================================================
 
 void IKSolver::compute_jacobian_(const float* joint_q, const float* body_q, int n_batch_actual) {
-    cudaMemset(jacobian_.gpu_data(), 0, n_batch_actual * n_residuals_ * n_dofs_ * sizeof(float));
+    int zero_n = n_batch_actual * n_residuals_ * n_dofs_;
+    ik_zero_float_kernel<<<div_up(zero_n, kBlockSize), kBlockSize, 0, stream_>>>(zero_n, jacobian_.gpu_data());
 
     compute_motion_subspace_(body_q, n_batch_actual);
 
@@ -396,7 +397,7 @@ void IKSolver::compute_jacobian_(const float* joint_q, const float* body_q, int 
         if (od.desc.type == IKObjectiveType::POSITION) {
             int total = n_batch_actual * n_dofs_;
             int grid = div_up(total, kBlockSize);
-            ik_pos_jac_analytic_kernel<<<grid, kBlockSize>>>(
+            ik_pos_jac_analytic_kernel<<<grid, kBlockSize, 0, stream_>>>(
                 n_batch_actual, n_dofs_, n_residuals_,
                 od.desc.link_index, od.desc.link_offset,
                 od.affects_dof.gpu_data(),
@@ -407,7 +408,7 @@ void IKSolver::compute_jacobian_(const float* joint_q, const float* body_q, int 
         } else if (od.desc.type == IKObjectiveType::ROTATION) {
             int total = n_batch_actual * n_dofs_;
             int grid = div_up(total, kBlockSize);
-            ik_rot_jac_analytic_kernel<<<grid, kBlockSize>>>(
+            ik_rot_jac_analytic_kernel<<<grid, kBlockSize, 0, stream_>>>(
                 n_batch_actual, n_dofs_, n_residuals_,
                 od.affects_dof.gpu_data(),
                 joint_S_s_.gpu_data(),
@@ -417,7 +418,7 @@ void IKSolver::compute_jacobian_(const float* joint_q, const float* body_q, int 
         } else if (od.desc.type == IKObjectiveType::JOINT_LIMIT) {
             int total = n_batch_actual * n_dofs_;
             int grid = div_up(total, kBlockSize);
-            ik_limit_jac_analytic_kernel<<<grid, kBlockSize>>>(
+            ik_limit_jac_analytic_kernel<<<grid, kBlockSize, 0, stream_>>>(
                 n_batch_actual, n_dofs_, n_residuals_, n_coords_,
                 joint_q,
                 model_->joint_limit_lower.gpu_data(),
@@ -435,7 +436,7 @@ void IKSolver::compute_jacobian_(const float* joint_q, const float* body_q, int 
 
 void IKSolver::compute_costs_(const float* residuals, float* costs_out, int n_batch_actual) {
     int grid = div_up(n_batch_actual, kBlockSize);
-    ik_compute_costs_kernel<<<grid, kBlockSize>>>(
+    ik_compute_costs_kernel<<<grid, kBlockSize, 0, stream_>>>(
         n_batch_actual, n_residuals_, residuals, costs_out);
 }
 
@@ -448,9 +449,10 @@ void IKSolver::integrate_dq_(const float* joint_q_curr, const float* dq, float d
     int total = n_batch_actual * joint_count_;
     int grid = div_up(total, kBlockSize);
 
-    cudaMemset(joint_qd_scratch_.gpu_data(), 0, n_batch_actual * n_dofs_ * sizeof(float));
+    int zero_n = n_batch_actual * n_dofs_;
+    ik_zero_float_kernel<<<div_up(zero_n, kBlockSize), kBlockSize, 0, stream_>>>(zero_n, joint_qd_scratch_.gpu_data());
 
-    ik_integrate_dq_kernel<<<grid, kBlockSize>>>(
+    ik_integrate_dq_kernel<<<grid, kBlockSize, 0, stream_>>>(
         n_batch_actual, joint_count_, n_coords_, n_dofs_,
         model_->joint_type.gpu_data(),
         model_->joint_parent.gpu_data(),
@@ -518,9 +520,12 @@ void IKSolver::lm_step_(float* joint_q, float step_size, int iteration) {
     compute_jacobian_(joint_q, body_q_.gpu_data(), n_expanded_);
 
     // LM solve
-    cudaMemset(dq_dof_.gpu_data(), 0, n_expanded_ * n_dofs_ * sizeof(float));
+    {
+        int zero_n = n_expanded_ * n_dofs_;
+        ik_zero_float_kernel<<<div_up(zero_n, kBlockSize), kBlockSize, 0, stream_>>>(zero_n, dq_dof_.gpu_data());
+    }
     int grid = div_up(n_expanded_, kBlockSize);
-    ik_lm_solve_kernel<<<grid, kBlockSize>>>(
+    ik_lm_solve_kernel<<<grid, kBlockSize, 0, stream_>>>(
         n_expanded_, n_dofs_, n_residuals_,
         jacobian_.gpu_data(), residuals_.gpu_data(), lambda_values_.gpu_data(),
         dq_dof_.gpu_data(), pred_reduction_.gpu_data());
@@ -535,13 +540,13 @@ void IKSolver::lm_step_(float* joint_q, float step_size, int iteration) {
     compute_costs_(residuals_proposed_.gpu_data(), costs_proposed_.gpu_data(), n_expanded_);
 
     // Accept/reject
-    ik_accept_reject_kernel<<<grid, kBlockSize>>>(
+    ik_accept_reject_kernel<<<grid, kBlockSize, 0, stream_>>>(
         n_expanded_,
         costs_.gpu_data(), costs_proposed_.gpu_data(), pred_reduction_.gpu_data(),
         config_.rho_min, accept_flags_.gpu_data());
 
     // Update state
-    ik_update_lm_state_kernel<<<grid, kBlockSize>>>(
+    ik_update_lm_state_kernel<<<grid, kBlockSize, 0, stream_>>>(
         n_expanded_, n_coords_, n_residuals_,
         joint_q_proposed_.gpu_data(), residuals_proposed_.gpu_data(),
         costs_proposed_.gpu_data(), accept_flags_.gpu_data(),
@@ -819,8 +824,11 @@ void IKSolver::lbfgs_step_(float* joint_q, int iteration) {
     lbfgs_gradient_(joint_q, gradient_.gpu_data(), n_expanded_);
 
     if (iteration == 0) {
-        cudaMemcpy(gradient_prev_.gpu_data(), gradient_.gpu_data(),
-                   n_expanded_ * n_dofs_ * sizeof(float), cudaMemcpyDeviceToDevice);
+        {
+            int n = n_expanded_ * n_dofs_;
+            ik_copy_float_kernel<<<div_up(n, kBlockSize), kBlockSize>>>(
+                n, gradient_.gpu_data(), gradient_prev_.gpu_data());
+        }
 
         // Initial step: -1e-2 * gradient
         int total = n_expanded_ * n_dofs_;
@@ -831,8 +839,11 @@ void IKSolver::lbfgs_step_(float* joint_q, int iteration) {
 
         integrate_dq_(joint_q, last_step_dq_.gpu_data(), 1.0f,
                       joint_q_proposed_.gpu_data(), n_expanded_);
-        cudaMemcpy(joint_q, joint_q_proposed_.gpu_data(),
-                   n_expanded_ * n_coords_ * sizeof(float), cudaMemcpyDeviceToDevice);
+        {
+            int n = n_expanded_ * n_coords_;
+            ik_copy_float_kernel<<<div_up(n, kBlockSize), kBlockSize>>>(
+                n, joint_q_proposed_.gpu_data(), joint_q);
+        }
         return;
     }
 
@@ -868,8 +879,11 @@ void IKSolver::lbfgs_step_(float* joint_q, int iteration) {
     }
 
     // Save gradient_prev
-    cudaMemcpy(gradient_prev_.gpu_data(), gradient_.gpu_data(),
-               n_expanded_ * n_dofs_ * sizeof(float), cudaMemcpyDeviceToDevice);
+    {
+        int n = n_expanded_ * n_dofs_;
+        ik_copy_float_kernel<<<div_up(n, kBlockSize), kBlockSize>>>(
+            n, gradient_.gpu_data(), gradient_prev_.gpu_data());
+    }
 
     // Line search
     lbfgs_line_search_(joint_q);
@@ -879,57 +893,130 @@ void IKSolver::lbfgs_step_(float* joint_q, int iteration) {
 // Main step
 // ============================================================================
 
+// ============================================================================
+// Record CUDA Graph for the LM iteration loop
+// ============================================================================
+
+void IKSolver::lm_record_graph_(int iterations, float step_size) {
+    if (lm_graph_exec_) {
+        cudaGraphExecDestroy(lm_graph_exec_);
+        lm_graph_exec_ = nullptr;
+    }
+    if (lm_graph_) {
+        cudaGraphDestroy(lm_graph_);
+        lm_graph_ = nullptr;
+    }
+
+    cudaStream_t capture_stream;
+    cudaStreamCreate(&capture_stream);
+
+    // All internal helper functions use stream_ for kernel launches
+    stream_ = capture_stream;
+
+    cudaStreamBeginCapture(capture_stream, cudaStreamCaptureModeThreadLocal);
+
+    float* work_q = joint_q_expanded_.gpu_data();
+
+    ik_fill_float_kernel<<<div_up(n_expanded_, kBlockSize), kBlockSize, 0, stream_>>>(
+        n_expanded_, config_.lambda_initial, lambda_values_.gpu_data());
+
+    for (int i = 0; i < iterations; ++i) {
+        lm_step_(work_q, step_size, i);
+    }
+
+    compute_fk_(work_q, body_q_.gpu_data(), n_expanded_);
+    compute_residuals_(work_q, body_q_.gpu_data(), residuals_.gpu_data(), n_expanded_);
+    compute_costs_(residuals_.gpu_data(), costs_.gpu_data(), n_expanded_);
+
+    if (n_seeds_ > 1) {
+        int grid = div_up(n_problems_, kBlockSize);
+        ik_select_best_seed_kernel<<<grid, kBlockSize, 0, stream_>>>(
+            n_problems_, n_seeds_, costs_.gpu_data(), best_indices_.gpu_data());
+    }
+
+    cudaStreamEndCapture(capture_stream, &lm_graph_);
+    cudaStreamDestroy(capture_stream);
+
+    stream_ = nullptr;
+
+    cudaGraphInstantiate(&lm_graph_exec_, lm_graph_, nullptr, nullptr, 0);
+
+    lm_graph_iters_ = iterations;
+    lm_graph_step_size_ = step_size;
+    lm_graph_valid_ = true;
+}
+
+// ============================================================================
+// Main step
+// ============================================================================
+
 void IKSolver::step(const float* joint_q_in, float* joint_q_out,
                      int iterations, float step_size,
                      std::uintptr_t /*cuda_stream*/) {
-    // Sample
+    stream_ = nullptr;
+
+    // Sample (uses RNG state, must run outside graph)
     sample_(joint_q_in);
 
     float* work_q = joint_q_expanded_.gpu_data();
 
     if (config_.optimizer == IKOptimizerType::LM) {
-        // Initialize lambda
-        std::vector<float> lam_h(n_expanded_, config_.lambda_initial);
-        cudaMemcpy(lambda_values_.gpu_data(), lam_h.data(),
-                   n_expanded_ * sizeof(float), cudaMemcpyHostToDevice);
+        // Record graph on first call or when parameters change
+        if (!lm_graph_valid_ || lm_graph_iters_ != iterations
+            || lm_graph_step_size_ != step_size) {
+            lm_record_graph_(iterations, step_size);
+        }
 
-        for (int i = 0; i < iterations; ++i) {
-            lm_step_(work_q, step_size, i);
+        // Launch the captured graph on the default stream
+        cudaGraphLaunch(lm_graph_exec_, 0);
+
+        // Copy result to output
+        if (n_seeds_ > 1) {
+            int total = n_problems_ * n_coords_;
+            int grid = div_up(total, kBlockSize);
+            ik_gather_best_seed_kernel<<<grid, kBlockSize>>>(
+                n_problems_, n_seeds_, n_coords_,
+                work_q, best_indices_.gpu_data(),
+                const_cast<float*>(joint_q_out));
+        } else {
+            int n = n_problems_ * n_coords_;
+            ik_copy_float_kernel<<<div_up(n, kBlockSize), kBlockSize>>>(
+                n, work_q, const_cast<float*>(joint_q_out));
         }
     } else {
-        // L-BFGS
-        cudaMemset(history_count_.gpu_data(), 0, n_expanded_ * sizeof(int));
-        cudaMemset(history_start_.gpu_data(), 0, n_expanded_ * sizeof(int));
+        // L-BFGS (no Graph for now due to dynamic allocations in line search)
+        ik_zero_float_kernel<<<div_up(n_expanded_, kBlockSize), kBlockSize>>>(
+            n_expanded_, reinterpret_cast<float*>(history_count_.gpu_data()));
+        ik_zero_float_kernel<<<div_up(n_expanded_, kBlockSize), kBlockSize>>>(
+            n_expanded_, reinterpret_cast<float*>(history_start_.gpu_data()));
 
-        // Initial FK + residuals
         compute_fk_(work_q, body_q_.gpu_data(), n_expanded_);
         compute_residuals_(work_q, body_q_.gpu_data(), residuals_.gpu_data(), n_expanded_);
 
         for (int i = 0; i < iterations; ++i) {
             lbfgs_step_(work_q, i);
         }
-    }
 
-    // Compute final costs
-    compute_fk_(work_q, body_q_.gpu_data(), n_expanded_);
-    compute_residuals_(work_q, body_q_.gpu_data(), residuals_.gpu_data(), n_expanded_);
-    compute_costs_(residuals_.gpu_data(), costs_.gpu_data(), n_expanded_);
+        // Final costs
+        compute_fk_(work_q, body_q_.gpu_data(), n_expanded_);
+        compute_residuals_(work_q, body_q_.gpu_data(), residuals_.gpu_data(), n_expanded_);
+        compute_costs_(residuals_.gpu_data(), costs_.gpu_data(), n_expanded_);
 
-    // Select best seeds and copy to output
-    if (n_seeds_ > 1) {
-        int grid = div_up(n_problems_, kBlockSize);
-        ik_select_best_seed_kernel<<<grid, kBlockSize>>>(
-            n_problems_, n_seeds_, costs_.gpu_data(), best_indices_.gpu_data());
-
-        int total = n_problems_ * n_coords_;
-        grid = div_up(total, kBlockSize);
-        ik_gather_best_seed_kernel<<<grid, kBlockSize>>>(
-            n_problems_, n_seeds_, n_coords_,
-            work_q, best_indices_.gpu_data(),
-            const_cast<float*>(joint_q_out));
-    } else {
-        cudaMemcpy(const_cast<float*>(joint_q_out), work_q,
-                   n_problems_ * n_coords_ * sizeof(float), cudaMemcpyDeviceToDevice);
+        if (n_seeds_ > 1) {
+            int grid = div_up(n_problems_, kBlockSize);
+            ik_select_best_seed_kernel<<<grid, kBlockSize>>>(
+                n_problems_, n_seeds_, costs_.gpu_data(), best_indices_.gpu_data());
+            int total = n_problems_ * n_coords_;
+            grid = div_up(total, kBlockSize);
+            ik_gather_best_seed_kernel<<<grid, kBlockSize>>>(
+                n_problems_, n_seeds_, n_coords_,
+                work_q, best_indices_.gpu_data(),
+                const_cast<float*>(joint_q_out));
+        } else {
+            int n = n_problems_ * n_coords_;
+            ik_copy_float_kernel<<<div_up(n, kBlockSize), kBlockSize>>>(
+                n, work_q, const_cast<float*>(joint_q_out));
+        }
     }
 }
 

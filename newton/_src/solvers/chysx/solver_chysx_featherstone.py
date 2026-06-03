@@ -51,6 +51,7 @@ class SolverChysXFeatherstone:
         self._state_out.allocate(model.joint_coord_count, model.joint_dof_count)
 
         self._body_f_ext = wp.zeros(model.body_count, dtype=wp.spatial_vector, device=self._device)
+        self._fixed_gravity = True
 
     def _populate_model(self, model: Model) -> None:
         """Transfer all model data from Newton to ChysX ArticulationModel."""
@@ -166,9 +167,9 @@ class SolverChysXFeatherstone:
 
         stream = wp.get_stream(self._device).cuda_stream
 
-        # Sync gravity from Newton model (may change between steps)
-        n_worlds = model.gravity.shape[0] if len(model.gravity.shape) > 0 else 1
-        self._chysx_model.sync_gravity_from_ptr(model.gravity.ptr, n_worlds)
+        if not self._fixed_gravity:
+            n_worlds = model.gravity.shape[0] if len(model.gravity.shape) > 0 else 1
+            self._chysx_model.sync_gravity_from_ptr(model.gravity.ptr, n_worlds)
 
         # Copy joint_q and joint_qd from Newton state to ChysX state (device→device)
         self._state_in.upload_joint_q(state_in.joint_q.ptr, model.joint_coord_count)

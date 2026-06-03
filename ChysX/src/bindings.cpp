@@ -1649,8 +1649,8 @@ Constant across timesteps. Populated from Python, then passed to the solver.
         })
         .def("sync_gravity_from_ptr", [](chysx::rigid::ArticulationModel& self,
                                         std::uintptr_t src_ptr, int n_worlds) {
-            cudaMemcpy(self.gravity.gpu_data(), reinterpret_cast<const void*>(src_ptr),
-                       n_worlds * sizeof(chysx::math::Vec3f), cudaMemcpyDeviceToDevice);
+            cudaMemcpyAsync(self.gravity.gpu_data(), reinterpret_cast<const void*>(src_ptr),
+                       n_worlds * sizeof(chysx::math::Vec3f), cudaMemcpyDeviceToDevice, 0);
         })
         .def("upload_descendant_info", [](chysx::rigid::ArticulationModel& self,
                                           py::array_t<int> indices,
@@ -1684,12 +1684,12 @@ Per-timestep state for Featherstone solver.
             self.joint_qd.resize(joint_dof_count);
         })
         .def("upload_joint_q", [](chysx::rigid::ArticulationState& self, std::uintptr_t src_ptr, int n) {
-            cudaMemcpy(self.joint_q.gpu_data(), reinterpret_cast<const void*>(src_ptr),
-                       n * sizeof(float), cudaMemcpyDeviceToDevice);
+            cudaMemcpyAsync(self.joint_q.gpu_data(), reinterpret_cast<const void*>(src_ptr),
+                       n * sizeof(float), cudaMemcpyDeviceToDevice, 0);
         })
         .def("upload_joint_qd", [](chysx::rigid::ArticulationState& self, std::uintptr_t src_ptr, int n) {
-            cudaMemcpy(self.joint_qd.gpu_data(), reinterpret_cast<const void*>(src_ptr),
-                       n * sizeof(float), cudaMemcpyDeviceToDevice);
+            cudaMemcpyAsync(self.joint_qd.gpu_data(), reinterpret_cast<const void*>(src_ptr),
+                       n * sizeof(float), cudaMemcpyDeviceToDevice, 0);
         })
         .def("joint_q_ptr", [](chysx::rigid::ArticulationState& self) -> std::uintptr_t {
             return reinterpret_cast<std::uintptr_t>(self.joint_q.gpu_data());
@@ -1699,14 +1699,14 @@ Per-timestep state for Featherstone solver.
         })
         .def("copy_joint_q_to", [](chysx::rigid::ArticulationState& self, std::uintptr_t dst_ptr, int n) {
             if (n > 0 && self.joint_q.gpu_data()) {
-                cudaMemcpy(reinterpret_cast<void*>(dst_ptr), self.joint_q.gpu_data(),
-                           n * sizeof(float), cudaMemcpyDeviceToDevice);
+                cudaMemcpyAsync(reinterpret_cast<void*>(dst_ptr), self.joint_q.gpu_data(),
+                           n * sizeof(float), cudaMemcpyDeviceToDevice, 0);
             }
         })
         .def("copy_joint_qd_to", [](chysx::rigid::ArticulationState& self, std::uintptr_t dst_ptr, int n) {
             if (n > 0 && self.joint_qd.gpu_data()) {
-                cudaMemcpy(reinterpret_cast<void*>(dst_ptr), self.joint_qd.gpu_data(),
-                           n * sizeof(float), cudaMemcpyDeviceToDevice);
+                cudaMemcpyAsync(reinterpret_cast<void*>(dst_ptr), self.joint_qd.gpu_data(),
+                           n * sizeof(float), cudaMemcpyDeviceToDevice, 0);
             }
         });
 
@@ -1756,15 +1756,15 @@ Run one Featherstone step. All pointer arguments are raw CUDA device pointers (i
         .def("copy_body_q_to", [](chysx::rigid::FeatherstoneSolver& self, std::uintptr_t dst_ptr) {
             int n = self.body_count();
             if (n > 0 && self.body_q_ptr()) {
-                cudaMemcpy(reinterpret_cast<void*>(dst_ptr), self.body_q_ptr(),
-                           n * 7 * sizeof(float), cudaMemcpyDeviceToDevice);
+                cudaMemcpyAsync(reinterpret_cast<void*>(dst_ptr), self.body_q_ptr(),
+                           n * 7 * sizeof(float), cudaMemcpyDeviceToDevice, 0);
             }
         })
         .def("copy_body_qd_to", [](chysx::rigid::FeatherstoneSolver& self, std::uintptr_t dst_ptr) {
             int n = self.body_count();
             if (n > 0 && self.body_qd_ptr()) {
-                cudaMemcpy(reinterpret_cast<void*>(dst_ptr), self.body_qd_ptr(),
-                           n * 6 * sizeof(float), cudaMemcpyDeviceToDevice);
+                cudaMemcpyAsync(reinterpret_cast<void*>(dst_ptr), self.body_qd_ptr(),
+                           n * 6 * sizeof(float), cudaMemcpyDeviceToDevice, 0);
             }
         })
         .def("body_count", &chysx::rigid::FeatherstoneSolver::body_count)
@@ -1790,7 +1790,8 @@ Run one Featherstone step. All pointer arguments are raw CUDA device pointers (i
         .def_readwrite("wolfe_c1", &chysx::ik::IKConfig::wolfe_c1)
         .def_readwrite("wolfe_c2", &chysx::ik::IKConfig::wolfe_c2)
         .def_readwrite("noise_std", &chysx::ik::IKConfig::noise_std)
-        .def_readwrite("rng_seed", &chysx::ik::IKConfig::rng_seed);
+        .def_readwrite("rng_seed", &chysx::ik::IKConfig::rng_seed)
+        .def_readwrite("convergence_tol", &chysx::ik::IKConfig::convergence_tol);
 
     py::enum_<chysx::ik::IKOptimizerType>(m, "IKOptimizerType")
         .value("LM", chysx::ik::IKOptimizerType::LM)

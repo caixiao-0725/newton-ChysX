@@ -394,5 +394,48 @@ __global__ void ik_fill_problem_idx_kernel(
     problem_idx[tid] = tid / n_seeds;
 }
 
+// ============================================================================
+// Fill a float buffer with a constant value (Graph-safe lambda init)
+// ============================================================================
+
+__global__ void ik_fill_float_kernel(
+    int n, float value,
+    float* __restrict__ out
+)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+    out[tid] = value;
+}
+
+// ============================================================================
+// Zero a float buffer via kernel (Graph-safe replacement for cudaMemset)
+// ============================================================================
+
+__global__ void ik_zero_float_kernel(
+    int n,
+    float* __restrict__ out
+)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+    out[tid] = 0.0f;
+}
+
+// ============================================================================
+// D2D copy via kernel (Graph-safe replacement for cudaMemcpy D2D)
+// ============================================================================
+
+__global__ void ik_copy_float_kernel(
+    int n,
+    const float* __restrict__ src,
+    float* __restrict__ dst
+)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+    dst[tid] = src[tid];
+}
+
 }  // namespace ik
 }  // namespace chysx

@@ -185,10 +185,10 @@ class Example:
             objectives=[self.pos_obj, self.rot_obj, self.joint_limits_obj],
             optimizer="lm",
             lambda_initial=0.1,
-            iterations=24,
+            iterations=12,
         )
 
-        self.ik_iters = 24
+        self.ik_iters = 12
 
     def capture(self):
         # CUDA graph capture is disabled when using ChysX's native
@@ -280,23 +280,25 @@ class Example:
         )
 
         self.soft_solver.rebuild_bvh(self.state_0)
+
+        particle_count = self.model.particle_count
+        saved_shape_contact_pair_count = self.model.shape_contact_pair_count
+
         for _step in range(self.sim_substeps):
             self.state_0.clear_forces()
             self.state_1.clear_forces()
 
             self.viewer.apply_forces(self.state_0)
 
-            particle_count = self.model.particle_count
+            # Featherstone uses its own baked gravity, no need to toggle model.gravity
             self.model.particle_count = 0
-            self.model.gravity.assign(self.gravity_zero)
             self.model.shape_contact_pair_count = 0
-
             self.state_0.joint_qd.assign(self.target_joint_qd)
             self.robot_solver.step(self.state_0, self.state_1, self.control, None, self.sim_dt)
 
             self.state_0.particle_f.zero_()
             self.model.particle_count = particle_count
-            self.model.gravity.assign(self.gravity_earth)
+            self.model.shape_contact_pair_count = saved_shape_contact_pair_count
 
             self.soft_solver.step(self.state_0, self.state_1, self.control, None, self.sim_dt)
 
