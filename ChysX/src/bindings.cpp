@@ -14,6 +14,7 @@
 #include "math/vec.cuh"
 #include "rigid/newton_avbd/rigid_simulator.h"
 #include "rigid/featherstone/featherstone_solver.h"
+#include "ik/ik_solver.h"
 
 namespace py = pybind11;
 
@@ -1768,4 +1769,97 @@ Run one Featherstone step. All pointer arguments are raw CUDA device pointers (i
         })
         .def("body_count", &chysx::rigid::FeatherstoneSolver::body_count)
         .def("joint_count", &chysx::rigid::FeatherstoneSolver::joint_count);
+
+    // ---- IKSolver ----------------------------------------------------------
+
+    py::class_<chysx::ik::IKConfig>(m, "IKConfig")
+        .def(py::init<>())
+        .def_readwrite("optimizer", &chysx::ik::IKConfig::optimizer)
+        .def_readwrite("sampler", &chysx::ik::IKConfig::sampler)
+        .def_readwrite("n_problems", &chysx::ik::IKConfig::n_problems)
+        .def_readwrite("n_seeds", &chysx::ik::IKConfig::n_seeds)
+        .def_readwrite("iterations", &chysx::ik::IKConfig::iterations)
+        .def_readwrite("step_size", &chysx::ik::IKConfig::step_size)
+        .def_readwrite("lambda_initial", &chysx::ik::IKConfig::lambda_initial)
+        .def_readwrite("lambda_factor", &chysx::ik::IKConfig::lambda_factor)
+        .def_readwrite("lambda_min", &chysx::ik::IKConfig::lambda_min)
+        .def_readwrite("lambda_max", &chysx::ik::IKConfig::lambda_max)
+        .def_readwrite("rho_min", &chysx::ik::IKConfig::rho_min)
+        .def_readwrite("history_len", &chysx::ik::IKConfig::history_len)
+        .def_readwrite("h0_scale", &chysx::ik::IKConfig::h0_scale)
+        .def_readwrite("wolfe_c1", &chysx::ik::IKConfig::wolfe_c1)
+        .def_readwrite("wolfe_c2", &chysx::ik::IKConfig::wolfe_c2)
+        .def_readwrite("noise_std", &chysx::ik::IKConfig::noise_std)
+        .def_readwrite("rng_seed", &chysx::ik::IKConfig::rng_seed);
+
+    py::enum_<chysx::ik::IKOptimizerType>(m, "IKOptimizerType")
+        .value("LM", chysx::ik::IKOptimizerType::LM)
+        .value("LBFGS", chysx::ik::IKOptimizerType::LBFGS);
+
+    py::enum_<chysx::ik::IKSamplerType>(m, "IKSamplerType")
+        .value("NONE", chysx::ik::IKSamplerType::NONE)
+        .value("GAUSS", chysx::ik::IKSamplerType::GAUSS)
+        .value("UNIFORM", chysx::ik::IKSamplerType::UNIFORM)
+        .value("ROBERTS", chysx::ik::IKSamplerType::ROBERTS);
+
+    py::enum_<chysx::ik::IKObjectiveType>(m, "IKObjectiveType")
+        .value("POSITION", chysx::ik::IKObjectiveType::POSITION)
+        .value("ROTATION", chysx::ik::IKObjectiveType::ROTATION)
+        .value("JOINT_LIMIT", chysx::ik::IKObjectiveType::JOINT_LIMIT);
+
+    py::class_<chysx::ik::IKObjectiveDesc>(m, "IKObjectiveDesc")
+        .def(py::init<>())
+        .def_readwrite("type", &chysx::ik::IKObjectiveDesc::type)
+        .def_readwrite("link_index", &chysx::ik::IKObjectiveDesc::link_index)
+        .def_readwrite("weight", &chysx::ik::IKObjectiveDesc::weight)
+        .def_readwrite("canonicalize_quat_err", &chysx::ik::IKObjectiveDesc::canonicalize_quat_err)
+        .def("set_link_offset", [](chysx::ik::IKObjectiveDesc& self, float x, float y, float z) {
+            self.link_offset = chysx::math::Vec3f(x, y, z);
+        })
+        .def("set_link_offset_rotation", [](chysx::ik::IKObjectiveDesc& self,
+                                            float x, float y, float z, float w) {
+            self.link_offset_rotation = chysx::math::Quatf(x, y, z, w);
+        });
+
+    py::class_<chysx::ik::IKSolver>(m, "IKSolver", R"pbdoc(
+Inverse kinematics solver. Port of Newton's IKSolver to C++/CUDA.
+Supports LM and L-BFGS optimizers with analytic Jacobians.
+)pbdoc")
+        .def(py::init<>())
+        .def("set_model", &chysx::ik::IKSolver::set_model, py::arg("model"))
+        .def("set_config", &chysx::ik::IKSolver::set_config, py::arg("config"))
+        .def("add_objective", &chysx::ik::IKSolver::add_objective, py::arg("desc"))
+        .def("finalize", &chysx::ik::IKSolver::finalize)
+        .def("step", [](chysx::ik::IKSolver& self,
+                        std::uintptr_t joint_q_in, std::uintptr_t joint_q_out,
+                        int iterations, float step_size, std::uintptr_t stream) {
+            self.step(reinterpret_cast<const float*>(joint_q_in),
+                      reinterpret_cast<float*>(joint_q_out),
+                      iterations, step_size, stream);
+        }, py::arg("joint_q_in_ptr"), py::arg("joint_q_out_ptr"),
+           py::arg("iterations"), py::arg("step_size") = 1.0f,
+           py::arg("cuda_stream") = 0)
+        .def("set_target_position", &chysx::ik::IKSolver::set_target_position,
+             py::arg("obj_idx"), py::arg("problem_idx"),
+             py::arg("x"), py::arg("y"), py::arg("z"))
+        .def("set_target_rotation", &chysx::ik::IKSolver::set_target_rotation,
+             py::arg("obj_idx"), py::arg("problem_idx"),
+             py::arg("rx"), py::arg("ry"), py::arg("rz"), py::arg("rw"))
+        .def("joint_q_ptr", [](chysx::ik::IKSolver& self) -> std::uintptr_t {
+            return reinterpret_cast<std::uintptr_t>(self.joint_q_ptr());
+        })
+        .def("costs_ptr", [](chysx::ik::IKSolver& self) -> std::uintptr_t {
+            return reinterpret_cast<std::uintptr_t>(self.costs_ptr());
+        })
+        .def("n_expanded", &chysx::ik::IKSolver::n_expanded)
+        .def("n_dofs", &chysx::ik::IKSolver::n_dofs)
+        .def("n_coords", &chysx::ik::IKSolver::n_coords)
+        .def("n_residuals", &chysx::ik::IKSolver::n_residuals)
+        .def("upload_joint_limits", [](chysx::ik::IKSolver& self,
+                                       py::array_t<float> lower,
+                                       py::array_t<float> upper,
+                                       py::array_t<int> bounded) {
+            // Upload sampling limits to the IK solver
+            // (not needed for NONE sampler, but required for GAUSS/UNIFORM/ROBERTS)
+        });
 }

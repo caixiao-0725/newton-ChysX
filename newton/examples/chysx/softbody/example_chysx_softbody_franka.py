@@ -7,9 +7,9 @@
 # Identical to newton/examples/softbody/example_softbody_franka.py but
 # using ChysX's CoupledSimulator (VBD in CUDA C++) instead of Newton's
 # SolverVBD for the particle soft-body solve, and ChysX's native
-# FeatherstoneSolver (C++/CUDA) for rigid body dynamics.  Only the IK
-# solver still runs through Newton/Warp.  Collision detection uses
-# ChysX's native CollisionPipeline (C++/CUDA).
+# FeatherstoneSolver (C++/CUDA) for rigid body dynamics.  The IK
+# solver also runs through ChysX's native C++/CUDA implementation.
+# Collision detection uses ChysX's native CollisionPipeline (C++/CUDA).
 ###########################################################################
 
 from __future__ import annotations
@@ -20,10 +20,9 @@ from pxr import Usd
 
 import newton
 import newton.examples
-import newton.ik as ik
 import newton.utils
 from newton import ModelBuilder, eval_fk
-from newton.solvers import SolverChysXCoupled, SolverChysXFeatherstone
+from newton.solvers import SolverChysXCoupled, SolverChysXFeatherstone, SolverChysXIK
 
 
 @wp.kernel
@@ -143,6 +142,8 @@ class Example:
         self.capture()
 
     def set_up_ik(self):
+        import newton.ik as ik
+
         state = self.model.state()
         eval_fk(self.model, self.model.joint_q, self.model.joint_qd, state)
 
@@ -178,12 +179,13 @@ class Example:
             weight=10.0,
         )
 
-        self.ik_solver = ik.IKSolver(
+        self.ik_solver = SolverChysXIK(
             model=self.model,
             n_problems=1,
             objectives=[self.pos_obj, self.rot_obj, self.joint_limits_obj],
+            optimizer="lm",
             lambda_initial=0.1,
-            jacobian_mode=ik.IKJacobianType.ANALYTIC,
+            iterations=24,
         )
 
         self.ik_iters = 24
@@ -246,8 +248,8 @@ class Example:
         target_prev = self.targets[current_interval - 1] if current_interval > 0 else target_cur
         target_interp = (1.0 - alpha) * target_prev + alpha * target_cur
 
-        self.pos_obj.set_target_position(0, wp.vec3(*target_interp[:3].tolist()))
-        self.rot_obj.set_target_rotation(0, wp.vec4(*target_interp[3:7].tolist()))
+        self.ik_solver.set_target_position(0, 0, wp.vec3(*target_interp[:3].tolist()))
+        self.ik_solver.set_target_rotation(1, 0, wp.vec4(*target_interp[3:7].tolist()))
 
         finger_pos = float(target_interp[-1]) * 0.04
         self.finger_pos_buf.fill_(finger_pos)

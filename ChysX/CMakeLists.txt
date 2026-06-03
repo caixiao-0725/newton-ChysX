@@ -61,6 +61,8 @@ add_library(chysx_core STATIC
 
     src/rigid/featherstone/featherstone_solver.cu
 
+    src/ik/ik_solver.cu
+
     src/cloth/cloth_simulator.cu
     src/coupled/coupled_simulator.cu
 )
