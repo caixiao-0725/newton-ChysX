@@ -71,6 +71,7 @@ newton
    eval_ik
    eval_jacobian
    eval_mass_matrix
+   intersect_ray
 
 .. rubric:: Constants
 
@@ -82,4 +83,6 @@ newton
    * - ``MAXVAL``
      - ``10000000000.0``
    * - ``__version__``
-     - ``1.2.0.dev0``
+     - ``1.3.0.dev0``
+   * - ``use_coord_layout_targets``
+     - ``False``
